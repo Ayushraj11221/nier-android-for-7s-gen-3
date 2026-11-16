@@ -33,11 +33,24 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358"
 
-      - name: Generate the debug keystore
+      # The fixed release key (GitHub secrets NIER_KS_B64, NIER_KS_PASS, NIER_KEY_ALIAS, NIER_KEY_PASS): the same
+      # signature on every build, so a new APK installs over the old app. Without the secrets: a throwaway debug key.
+      - name: Prepare the signing key
+        env:
+          NIER_KS_B64: ${{ secrets.NIER_KS_B64 }}
+          NIER_KS_PASS: ${{ secrets.NIER_KS_PASS }}
         run: |
           mkdir -p "$HOME/.android"
-          keytool -genkey -v -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey \
-            -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          if [ -n "$NIER_KS_B64" ]; then
+            echo "$NIER_KS_B64" | base64 -d > "$HOME/.android/nier-release.keystore"
+            keytool -list -keystore "$HOME/.android/nier-release.keystore" -storepass "$NIER_KS_PASS" > /dev/null \
+              || { echo "The release keystore does not open: check NIER_KS_B64 and NIER_KS_PASS" >&2; exit 1; }
+            echo "Signing with the fixed release key"
+          else
+            keytool -genkey -v -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey \
+              -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            echo "No NIER_KS_B64 secret: signing with a throwaway debug key (the APK will not install over an older build)"
+          fi
 
       # CMakeLists.txt reads "$VULKAN_SDK/Include" (capital I): a folder with that name pointing at the headers.
       - name: Vulkan headers 1.4.357
@@ -70,6 +83,10 @@ jobs:
           sudo chown -R "$USER" private
 
       - name: Build the NieR APK
+        env:
+          NIER_KS_PASS: ${{ secrets.NIER_KS_PASS }}
+          NIER_KEY_PASS: ${{ secrets.NIER_KEY_PASS }}
+          NIER_KEY_ALIAS: ${{ secrets.NIER_KEY_ALIAS }}
         run: |
           export VULKAN_SDK="$HOME/vulkan-sdk"
           bash android/build_nier_ci.sh

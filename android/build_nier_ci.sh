@@ -44,13 +44,18 @@ done
 
 # resources, with the project's own launcher icon when there is one
 "$bt/aapt2" compile --dir "$root/android/res" -o "$out/res.zip"
-manifest="$root/games/nier/AndroidManifest.xml"
+# A copy of the manifest with versionCode = 1000 + the CI run number: always rising, so each build installs as an
+# update (versionName stays the one in games/nier/AndroidManifest.xml).
+manifest="$out/AndroidManifest.xml"
+vcode=$((1000 + ${GITHUB_RUN_NUMBER:-0}))
+sed "s/android:versionCode=\"[0-9]*\"/android:versionCode=\"$vcode\"/" "$root/games/nier/AndroidManifest.xml" > "$manifest"
+grep -q "android:versionCode=\"$vcode\"" "$manifest" || { echo "could not set versionCode in the manifest" >&2; exit 1; }
+echo "versionCode $vcode"
 reszips=("$out/res.zip")
 if [ -d "$root/games/nier/icon/res" ]; then
     "$bt/aapt2" compile --dir "$root/games/nier/icon/res" -o "$out/icon.zip"
     reszips+=("$out/icon.zip")
-    sed 's/<application/<application android:icon="@mipmap\/ic_launcher"/' "$manifest" > "$out/AndroidManifest.xml"
-    manifest="$out/AndroidManifest.xml"
+    sed -i 's/<application/<application android:icon="@mipmap\/ic_launcher"/' "$manifest"
 fi
 "$bt/aapt2" link -o "$out/base.apk" -I "$jar" --manifest "$manifest" "${reszips[@]}"
 
@@ -66,7 +71,17 @@ find "$out/classes" -name '*.class' > "$out/classes.txt"
 zip -q -j "$out/base.apk" "$out/dex/classes.dex"
 
 "$bt/zipalign" -f -p 4 "$out/base.apk" "$out/aligned.apk"
-"$bt/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android --key-pass pass:android \
-    --out "$out/nier.apk" "$out/aligned.apk"
-"$bt/apksigner" verify "$out/nier.apk"
+release_ks="$HOME/.android/nier-release.keystore"
+if [ -f "$release_ks" ] && [ -n "${NIER_KS_PASS:-}" ]; then
+    # the fixed key: passwords come from the environment, never the command line
+    export NIER_KEY_PASS="${NIER_KEY_PASS:-$NIER_KS_PASS}"
+    "$bt/apksigner" sign --ks "$release_ks" --ks-pass env:NIER_KS_PASS --ks-key-alias "${NIER_KEY_ALIAS:-nierkey}" \
+        --key-pass env:NIER_KEY_PASS --out "$out/nier.apk" "$out/aligned.apk"
+    echo "signed with the fixed release key"
+else
+    "$bt/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android --key-pass pass:android \
+        --out "$out/nier.apk" "$out/aligned.apk"
+    echo "signed with a throwaway debug key: this APK will not install over an older build"
+fi
+"$bt/apksigner" verify --print-certs "$out/nier.apk"
 echo "APK: $out/nier.apk ($(du -h "$out/nier.apk" | cut -f1))"
