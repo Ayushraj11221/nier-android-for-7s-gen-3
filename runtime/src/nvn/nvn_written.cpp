@@ -468,6 +468,15 @@ bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const C
                 uint64_t first = st.divisor ? inst_lo / st.divisor : lo, last = st.divisor ? inst_hi / st.divisor : hi;
                 from = std::min(from, first * st.stride + va.offset);
                 end = std::max(end, last * st.stride + va.offset + vk_block_bytes(vk_vertex_format(va.format)));
+                // The range covers whole vertices, whatever attributes this pass reads: the z-prepass, the shadow pass
+                // and the colour pass draw the same mesh range reading different attributes, and ranges that differed
+                // by a few bytes missed dedup_upload (it needs an equal address and size) and were copied again.
+                // NX_VERTEX_WHOLE=0: the exact attribute range as before.
+                static const bool whole = !(std::getenv("NX_VERTEX_WHOLE") && std::getenv("NX_VERTEX_WHOLE")[0] == '0');
+                if (whole && st.stride) {
+                    from = std::min(from, first * st.stride);
+                    end = std::max(end, std::min<uint64_t>(last * st.stride + st.stride, size));
+                }
             }
             from &= ~uint64_t(255);  // the attributes keep their alignment
         }
@@ -515,7 +524,18 @@ bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const C
         return true;
     }
     uint64_t bytes = uint64_t(count) * index_size(c.mask);
-    if (!written_read(cb, p, bytes, bytes, index_size(c.mask), in.index)) in.index = upload(p, bytes, 16);
+    if (!written_read(cb, p, bytes, bytes, index_size(c.mask), in.index)) {
+        // The same index range is bound by the z-prepass, the shadow pass and the colour pass of an object: one copy per
+        // submit through dedup_upload, as the vertex data has. NX_INDEX_DEDUP=0: a copy per draw as before.
+        static const bool dedup = !(std::getenv("NX_INDEX_DEDUP") && std::getenv("NX_INDEX_DEDUP")[0] == '0');
+        if (dedup) {
+            g_upload_kind = kUploadIndex;
+            in.index = dedup_upload(p, bytes, (bytes + 15) & ~15ull, 16);
+            g_upload_kind = kUploadOther;
+        } else {
+            in.index = upload(p, bytes, 16);
+        }
+    }
     return true;
 }
 
