@@ -812,7 +812,7 @@ public class Launcher extends Activity {
 
     // ---- logs ----
 
-    static final int LOG_TAIL = 1 << 20;  // the end of nx.log that goes in (the file grows with every run)
+    static final int LOG_TAIL = 4 << 20;  // the end of nx.log that goes in (the file grows with every run)
     static final int SHARE_TEXT = 100000;  // what the share sheet gets as text (an Intent travels in ~1 MB at most)
 
     // The end of a text file, at most `max` bytes, from the start of a line.
@@ -968,13 +968,21 @@ public class Launcher extends Activity {
         return sb.toString();
     }
 
-    // The runtime logs a line every 5000 SetRenderEnable calls (hundreds of lines a minute): no use in a report.
+    // Noise that fills the window and hides the run: the SetRenderEnable counter, the per-thread rows of every stall dump
+    // (80+ lines each), and the same line repeated (upload ring full ...): those collapse into one line with a count.
     static String withoutSpam(String text) {
-        StringBuilder sb = new StringBuilder(text.length());
+        StringBuilder sb = new StringBuilder(text.length() / 2);
+        String last = null;
+        int same = 0;
         for (String line : text.split("\n")) {
-            if (line.contains("SetRenderEnable(1) x")) continue;
+            if (line.contains("SetRenderEnable(1) x") || line.startsWith("  thread ")) continue;
+            if (line.equals(last)) { same++; continue; }
+            if (same > 0) sb.append("  (the line above, ").append(same).append(" more times)\n");
+            same = 0;
+            last = line;
             sb.append(line).append('\n');
         }
+        if (same > 0) sb.append("  (the line above, ").append(same).append(" more times)\n");
         return sb.toString();
     }
 
@@ -1026,10 +1034,10 @@ public class Launcher extends Activity {
             String perf = summary(nxText.isEmpty() ? prevText : nxText);
             sb.append("\n=== performance lines (last of the run) ===\n").append(perf.isEmpty() ? "(no nx.log: play first, then export)\n" : perf);
 
-            sb.append("\n=== nx.log").append(nxLog.length() > LOG_TAIL ? " (its last MB)" : "").append(" ===\n");
+            sb.append("\n=== nx.log").append(nxLog.length() > LOG_TAIL ? " (its last 4 MB, thread rows of stall dumps removed)" : "").append(" ===\n");
             sb.append(nxText.isEmpty() ? "(missing: the game has not run with this build yet)\n" : nxText);
             if (!prevText.isEmpty()) {
-                sb.append("\n=== nx.log.prev").append(nxLogPrev.length() > LOG_TAIL ? " (its last MB)" : "").append(" ===\n");
+                sb.append("\n=== nx.log.prev").append(nxLogPrev.length() > LOG_TAIL ? " (its last 4 MB, thread rows of stall dumps removed)" : "").append(" ===\n");
                 sb.append(prevText);
             }
             // The system log: the game's own lines (tag "nier") from every process of the app, then the last lines of all.
