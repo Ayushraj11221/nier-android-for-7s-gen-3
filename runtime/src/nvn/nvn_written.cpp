@@ -15,6 +15,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
 #include "nvn_draw_state.h"
 #include "platform.h"
 
@@ -46,9 +50,38 @@ struct Region {
 using Regions = std::map<const uint8_t*, Region>;
 using It = Regions::iterator;
 Regions g_regions;
+std::vector<std::shared_ptr<std::vector<uint8_t>>> g_before_pool;
+size_t s_before_pool_hint = 0;
 bool g_read = false;  // a copy was bound for reading since the last write_after_read
 uint64_t g_binds = 0;  // written_bind calls, ever (nvn_frames.cpp: did a dispatch write storage after the split)
 uint64_t g_shared = 0, g_merged = 0, g_composed = 0, g_indirect = 0;  // for written_log
+
+// Reusable snapshot buffer pool: prevents per-frame heap/mmap churn across compute write-back snapshots.
+std::shared_ptr<std::vector<uint8_t>> alloc_before(const uint8_t* src, uint64_t n) {
+    const size_t sz = g_before_pool.size();
+    for (size_t i = s_before_pool_hint; i < sz; ++i) {
+        if (g_before_pool[i].use_count() == 1) {
+            s_before_pool_hint = i + 1;
+            g_before_pool[i]->resize(n);
+            if (n) std::memcpy(g_before_pool[i]->data(), src, n);
+            return g_before_pool[i];
+        }
+    }
+    for (size_t i = 0; i < s_before_pool_hint && i < sz; ++i) {
+        if (g_before_pool[i].use_count() == 1) {
+            s_before_pool_hint = i + 1;
+            g_before_pool[i]->resize(n);
+            if (n) std::memcpy(g_before_pool[i]->data(), src, n);
+            return g_before_pool[i];
+        }
+    }
+    auto v = std::make_shared<std::vector<uint8_t>>(src, src + n);
+    if (sz < 512) {
+        g_before_pool.push_back(v);
+        s_before_pool_hint = g_before_pool.size();
+    }
+    return v;
+}
 
 // The regions overlapping [p, p + size), in address order.
 std::vector<It> overlapping(const uint8_t* p, uint64_t size) {
@@ -225,7 +258,7 @@ bool adopt(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded)
     r.cap = std::max(k.size + kTail, off + padded);
     r.up = alloc_anchored(r.cap, off);
     std::memset(r.up.ptr + k.size, 0, r.cap - k.size);
-    r.before = std::make_shared<std::vector<uint8_t>>(lo, lo + k.size);  // the GPU's bytes once the write-back lands
+    r.before = alloc_before(lo, k.size);  // the GPU's bytes once the write-back lands
     r.expect = k.expect;
     k.link->before = r.before, k.link->expect = r.expect;
     draw_end_rendering(cb, 2);
@@ -273,7 +306,7 @@ Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_
     frame_guest_read(lo, n, kReadWrittenBind);  // deferred write-backs over these bytes land first (nvn_frames.cpp)
     std::memcpy(r.up.ptr, lo, n);
     std::memset(r.up.ptr + n, 0, r.cap - n);
-    r.before = std::make_shared<std::vector<uint8_t>>(r.up.ptr, r.up.ptr + n);
+    r.before = alloc_before(r.up.ptr, n);
     for (It it : old)  // their parts: as they were before their own GPU writes
         if (it->second.before)
             std::memcpy(r.before->data() + (it->first - lo), it->second.before->data(), it->second.before->size());
@@ -678,15 +711,53 @@ void apply_write_back(const WriteBack& w) {
         from = copy.data();
     }
     uint8_t* expect = next_expect ? next_expect->data() : nullptr;
+    if (std::memcmp(from, was, w.size) == 0) {
+        if (next_before) std::memcpy(next_before->data(), from, w.size);
+        g_wb_ns += plat::monotonic_ns() - t0;
+        return;
+    }
     uint64_t k = 0, changed = 0;
-    for (; k + 8 <= w.size; k += 8) {
-        if (std::memcmp(from + k, was + k, 8) == 0) continue;
+    auto apply8 = [&](uint64_t diff, uint64_t off) {
+        if (!diff) return;
         changed++;
-        for (uint64_t b = k; b < k + 8; b += 4)
-            if (std::memcmp(from + b, was + b, 4) != 0) {
-                std::memcpy(w.to + b, from + b, 4);
-                if (expect) std::memcpy(expect + b, from + b, 4);
-            }
+        const uint32_t lo = static_cast<uint32_t>(diff);
+        const uint32_t hi = static_cast<uint32_t>(diff >> 32);
+        if (lo && hi) {
+            std::memcpy(w.to + off, from + off, 8);
+            if (expect) std::memcpy(expect + off, from + off, 8);
+        } else if (lo) {
+            std::memcpy(w.to + off, from + off, 4);
+            if (expect) std::memcpy(expect + off, from + off, 4);
+        } else {
+            std::memcpy(w.to + off + 4, from + off + 4, 4);
+            if (expect) std::memcpy(expect + off + 4, from + off + 4, 4);
+        }
+    };
+#if defined(__aarch64__) || defined(_M_ARM64)
+    for (; k + 64 <= w.size; k += 64) {
+        uint8x16_t d0 = veorq_u8(vld1q_u8(from + k), vld1q_u8(was + k));
+        uint8x16_t d1 = veorq_u8(vld1q_u8(from + k + 16), vld1q_u8(was + k + 16));
+        uint8x16_t d2 = veorq_u8(vld1q_u8(from + k + 32), vld1q_u8(was + k + 32));
+        uint8x16_t d3 = veorq_u8(vld1q_u8(from + k + 48), vld1q_u8(was + k + 48));
+        uint64x2_t or64 = vreinterpretq_u64_u8(vorrq_u8(vorrq_u8(d0, d1), vorrq_u8(d2, d3)));
+        if ((vgetq_lane_u64(or64, 0) | vgetq_lane_u64(or64, 1)) == 0) continue;
+        uint64x2_t x0 = vreinterpretq_u64_u8(d0), x1 = vreinterpretq_u64_u8(d1);
+        uint64x2_t x2 = vreinterpretq_u64_u8(d2), x3 = vreinterpretq_u64_u8(d3);
+        apply8(vgetq_lane_u64(x0, 0), k);
+        apply8(vgetq_lane_u64(x0, 1), k + 8);
+        apply8(vgetq_lane_u64(x1, 0), k + 16);
+        apply8(vgetq_lane_u64(x1, 1), k + 24);
+        apply8(vgetq_lane_u64(x2, 0), k + 32);
+        apply8(vgetq_lane_u64(x2, 1), k + 40);
+        apply8(vgetq_lane_u64(x3, 0), k + 48);
+        apply8(vgetq_lane_u64(x3, 1), k + 56);
+    }
+#endif
+    for (; k + 8 <= w.size; k += 8) {
+        uint64_t f_val, w_val;
+        std::memcpy(&f_val, from + k, 8);
+        std::memcpy(&w_val, was + k, 8);
+        apply8(f_val ^ w_val, k);
     }
     for (; k < w.size; k++)
         if (from[k] != was[k]) {
