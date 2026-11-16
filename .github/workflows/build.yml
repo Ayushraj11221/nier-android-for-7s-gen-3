@@ -97,3 +97,11 @@ jobs:
           name: nier-apk
           path: private/nier/apk_nce/nier.apk
           if-no-files-found: error
+
+      - name: Upload libnier.so with symbols (to name the hot spots of a profile.txt)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nier-symbols
+          path: private/nier/ba_nce/libnier.so
+          if-no-files-found: warn
+          retention-days: 30
