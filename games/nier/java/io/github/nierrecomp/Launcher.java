@@ -370,9 +370,9 @@ public class Launcher extends Activity {
                 new String[] {"Nintendo (A a la derecha, B abajo)", "Xbox / PC (A abajo, B a la derecha)"},
                 new String[] {"Nintendo (A right, B down)", "Xbox / PC (A down, B right)"}, 0));
         options.add(new Option("NX_UPLOAD_RING_MB", "Buffer de carga GPU (Streaming)", "GPU upload buffer (Streaming)",
-                new String[] {"64", "96", "128"},
-                new String[] {"64 MB (Dispositivos 4-6 GB)", "96 MB (Recomendado)", "128 MB (Mapas grandes / 8 GB+ RAM)"},
-                new String[] {"64 MB (4-6 GB devices)", "96 MB (Recommended)", "128 MB (Large maps / 8 GB+ RAM)"}, 1));
+                new String[] {"64", "96", "128", "256"},
+                new String[] {"64 MB (Dispositivos 4-6 GB)", "96 MB (Recomendado)", "128 MB (Mapas grandes / 8 GB+ RAM)", "256 MB (Prueba: menos spills en torres / más RAM)"},
+                new String[] {"64 MB (4-6 GB devices)", "96 MB (Recommended)", "128 MB (Large maps / 8 GB+ RAM)", "256 MB (Test: fewer spills in towers / more RAM)"}, 1));
         build();
     }
 
