@@ -56,7 +56,15 @@ void log(const char* fmt, ...) {
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     std::lock_guard lk(g_log_lock);
-    if (!g_log_file && plat::kDiagnostics) {  // NX_RELEASE: the system log only
+    // NX_RELEASE: the system log only, except on Android: logcat's buffer is small and shared with the whole phone, so
+    // a play session is gone from it by the time the launcher's "Export logs" runs. The file (nx.log, and nx.log.prev
+    // for the run before) is what that button sends.
+#if defined(__ANDROID__)
+    constexpr bool kLogFile = true;
+#else
+    constexpr bool kLogFile = plat::kDiagnostics;
+#endif
+    if (!g_log_file && kLogFile) {
         const char* path = std::getenv("NX_LOG");
 #if defined(__ANDROID__)
         std::string def = plat::data_root() + "/nx.log";  // next to the data, readable from the phone

@@ -926,6 +926,76 @@ public class Launcher extends Activity {
         }
     }
 
+    static String meminfo() {
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(new FileReader("/proc/meminfo"))) {
+            for (String l; (l = br.readLine()) != null; )
+                if (l.startsWith("MemTotal") || l.startsWith("MemAvailable") || l.startsWith("SwapTotal") || l.startsWith("SwapFree"))
+                    sb.append(l).append('\n');
+        } catch (Exception ignored) {
+        }
+        return sb.toString();
+    }
+
+    static String cpuFreqs() {
+        StringBuilder sb = new StringBuilder();
+        for (int k = 0; k < 16; k++) {
+            File f = new File("/sys/devices/system/cpu/cpu" + k + "/cpufreq/cpuinfo_max_freq");
+            if (!f.canRead()) continue;
+            try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+                String l = br.readLine();
+                if (l != null) sb.append("cpu").append(k).append(' ').append(l.trim()).append(" kHz\n");
+            } catch (Exception ignored) {
+            }
+        }
+        return sb.length() == 0 ? "(not readable)\n" : sb.toString();
+    }
+
+    static String readLogcat(String... args) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            java.util.List<String> cmd = new java.util.ArrayList<String>();
+            cmd.add("logcat");
+            cmd.add("-d");
+            for (String a : args) cmd.add(a);
+            Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+            try (BufferedReader br = new BufferedReader(new java.io.InputStreamReader(p.getInputStream()))) {
+                for (String line; (line = br.readLine()) != null; ) sb.append(line).append('\n');
+            }
+        } catch (Exception e) {
+            sb.append("logcat capture error: ").append(e.getMessage()).append('\n');
+        }
+        return sb.toString();
+    }
+
+    // The runtime logs a line every 5000 SetRenderEnable calls (hundreds of lines a minute): no use in a report.
+    static String withoutSpam(String text) {
+        StringBuilder sb = new StringBuilder(text.length());
+        for (String line : text.split("\n")) {
+            if (line.contains("SetRenderEnable(1) x")) continue;
+            sb.append(line).append('\n');
+        }
+        return sb.toString();
+    }
+
+    // The last lines of the kinds that show where the frame time goes (replay, GPU, the game's waits, threads, memory).
+    static String summary(String text) {
+        String[] keys = {"per frame over", "gpu busy", "gpu time feed", "the game's waits", "threads:", "present intervals",
+                "memory:", "governor", "gpu:", "stall:", "uploads of", "vertex source", "write-backs per frame"};
+        java.util.ArrayList<String> hits = new java.util.ArrayList<String>();
+        for (String line : text.split("\n")) {
+            for (String k : keys) {
+                if (line.contains(k)) {
+                    hits.add(line);
+                    break;
+                }
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = Math.max(0, hits.size() - 150); i < hits.size(); i++) sb.append(hits.get(i)).append('\n');
+        return sb.toString();
+    }
+
     void exportLogs() {
         try {
             File dl = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
@@ -939,25 +1009,32 @@ public class Launcher extends Activity {
             }
             sb.append("Device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n');
             sb.append("Android: ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
-            sb.append("Date: ").append(new java.util.Date()).append("\n\n=== logcat ===\n");
-            try {
-                Process p = Runtime.getRuntime().exec(new String[] {"logcat", "-d", "-t", "500"});
-                try (BufferedReader br = new BufferedReader(new java.io.InputStreamReader(p.getInputStream()))) {
-                    for (String line; (line = br.readLine()) != null; ) sb.append(line).append('\n');
-                }
-            } catch (Exception e) {
-                sb.append("logcat capture error: ").append(e.getMessage()).append('\n');
-            }
+            sb.append("Date: ").append(new java.util.Date()).append('\n');
+            sb.append("Hardware: ").append(Build.HARDWARE).append(", board ").append(Build.BOARD);
+            if (Build.VERSION.SDK_INT >= 31) sb.append(", SoC ").append(Build.SOC_MANUFACTURER).append(' ').append(Build.SOC_MODEL);
+            sb.append("\n\n=== memory ===\n").append(meminfo());
+            sb.append("\n=== CPU max clocks ===\n").append(cpuFreqs());
+            File config = new File(dataDir(), "config.txt");
+            sb.append("\n=== config.txt ===\n");
+            if (config.canRead()) sb.append(tail(config, 20000)); else sb.append("(none)\n");
+
             File nxLog = new File(dataDir(), "nx.log");
-            if (nxLog.canRead()) {
-                sb.append("\n=== nx.log").append(nxLog.length() > LOG_TAIL ? " (its last MB)" : "").append(" ===\n");
-                sb.append(tail(nxLog, LOG_TAIL));
-            }
             File nxLogPrev = new File(dataDir(), "nx.log.prev");
-            if (nxLogPrev.canRead()) {
+            String nxText = nxLog.canRead() ? withoutSpam(tail(nxLog, LOG_TAIL)) : "";
+            String prevText = nxLogPrev.canRead() ? withoutSpam(tail(nxLogPrev, LOG_TAIL)) : "";
+            // The lines that say where a frame's time goes, together, from the run that just ended (or the one before).
+            String perf = summary(nxText.isEmpty() ? prevText : nxText);
+            sb.append("\n=== performance lines (last of the run) ===\n").append(perf.isEmpty() ? "(no nx.log: play first, then export)\n" : perf);
+
+            sb.append("\n=== nx.log").append(nxLog.length() > LOG_TAIL ? " (its last MB)" : "").append(" ===\n");
+            sb.append(nxText.isEmpty() ? "(missing: the game has not run with this build yet)\n" : nxText);
+            if (!prevText.isEmpty()) {
                 sb.append("\n=== nx.log.prev").append(nxLogPrev.length() > LOG_TAIL ? " (its last MB)" : "").append(" ===\n");
-                sb.append(tail(nxLogPrev, LOG_TAIL));
+                sb.append(prevText);
             }
+            // The system log: the game's own lines (tag "nier") from every process of the app, then the last lines of all.
+            sb.append("\n=== logcat, tag nier (last 3000) ===\n").append(readLogcat("-t", "3000", "-s", "nier"));
+            sb.append("\n=== logcat, all tags (last 500) ===\n").append(readLogcat("-t", "500"));
             try (FileWriter w = new FileWriter(out)) {
                 w.write(sb.toString());
             }

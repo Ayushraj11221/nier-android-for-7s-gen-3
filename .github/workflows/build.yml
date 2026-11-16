@@ -1,0 +1,82 @@
+name: Build NieR Android APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-nier-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zip unzip patch
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK 35, build-tools 35.0.0 and NDK 28.2.13676358
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358"
+
+      - name: Generate the debug keystore
+        run: |
+          mkdir -p "$HOME/.android"
+          keytool -genkey -v -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey \
+            -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+
+      # CMakeLists.txt reads "$VULKAN_SDK/Include" (capital I): a folder with that name pointing at the headers.
+      - name: Vulkan headers 1.4.357
+        run: |
+          git clone --depth 1 --branch v1.4.357 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vkh \
+            || git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vkh
+          mkdir -p "$HOME/vulkan-sdk"
+          ln -s /tmp/vkh/include "$HOME/vulkan-sdk/Include"
+          test -f "$HOME/vulkan-sdk/Include/vulkan/vulkan.h"
+
+      # The shader translator for the phone (Ryujinx's, NativeAOT): slow, so it is cached until the translator changes.
+      - name: Cache the shader translator
+        id: harness
+        uses: actions/cache@v4
+        with:
+          path: private/build/spirv_harness_android_nier/libspirvharness.so
+          key: harness-nier-${{ hashFiles('tools/maxwell/**', 'games/nier/tools/build_harness_android.sh') }}
+
+      - name: Fetch the Ryubing source
+        if: steps.harness.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p private/third_party/ryubing
+          curl -fL --retry 5 --retry-delay 5 https://codeberg.org/Software_arch/Ryubing/archive/a82350bb77.tar.gz \
+            | tar -xz -C private/third_party/ryubing --strip-components=1
+
+      - name: Build the shader translator
+        if: steps.harness.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src mcr.microsoft.com/dotnet/sdk:10.0 sh games/nier/tools/build_harness_android.sh
+          sudo chown -R "$USER" private
+
+      - name: Build the NieR APK
+        run: |
+          export VULKAN_SDK="$HOME/vulkan-sdk"
+          bash android/build_nier_ci.sh
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nier-apk
+          path: private/nier/apk_nce/nier.apk
+          if-no-files-found: error
