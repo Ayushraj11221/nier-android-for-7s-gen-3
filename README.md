@@ -1,4 +1,4 @@
-# NieR:Automata for Android (native port)
+# NieR:Automata for Android (native port) This is just a testing fork and there is no guarantee it will run.
 
 An Android app that runs **your own copy** of NieR:Automata The End of YoRHa Edition (Nintendo Switch, update 1.0.3)
 natively on an arm64 phone or tablet. The Switch's operating system services, its audio, video and input, and NVN
