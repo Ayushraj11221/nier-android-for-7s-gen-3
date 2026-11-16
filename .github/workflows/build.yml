@@ -1,0 +1,62 @@
+name: Build NieR Android APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-nier-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies (Ninja, CMake, Vulkan headers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake libvulkan-dev zip unzip
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK 35, Build-Tools 35.0.0 & NDK 28.2.13676358
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;28.2.13676358"
+
+      - name: Generate Android debug keystore
+        run: |
+          mkdir -p "$HOME/.android"
+          keytool -genkey -v \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Build NieR APK
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          VULKAN_SDK: /usr
+        run: |
+          chmod +x android/build_apk.sh
+          ./android/build_apk.sh --game nier
+
+      - name: Upload patched NieR APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nier-android-dedup-apk
+          path: private/nier/apk/nier.apk
+          if-no-files-found: error
