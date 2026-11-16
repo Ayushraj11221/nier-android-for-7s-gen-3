@@ -40,7 +40,18 @@ void fputs_logged(CPU& c) {
 // recompiled with --hookable 9bf1d0,8fc7a8) and are hooked here. NX_NIER_FPS=30|60 (default: NX_FPS_CAP, the
 // launcher's, else 30).
 uint64_t g_vsync_setter = 0, g_update = 0, g_main = 0;
-bool g_is_103 = false;
+uint64_t g_presenter_offset = 0;
+uint64_t g_floor_slot_offset = 0;
+
+// Decode an ARM64 `ADRP X8, page` + `LDR X8, [X8, #imm12*8]` pair at `off` into the referenced module offset.
+uint64_t decode_adrp_ldr(uint64_t off, uint32_t adrp, uint32_t ldr) {
+    if ((adrp & 0x9f00001fu) != 0x90000008u || (ldr & 0xffc003ffu) != 0xf9400108u) return 0;
+    uint64_t imm = (((adrp >> 5) & 0x7ffffu) << 2) | ((adrp >> 29) & 3u);
+    if (imm & (1ull << 20)) imm |= ~((1ull << 21) - 1);
+    const uint64_t page = (off & ~0xfffull) + (imm << 12);
+    const uint64_t ldr_off = ((ldr >> 10) & 0xfffu) << 3;
+    return page + ldr_off;
+}
 
 int target_fps() {
     static const int fps = [] {
@@ -58,16 +69,14 @@ void vsync_hook(CPU& c) {
     // The presenter starts with mode and applied mode 0 (zeroed memory) while the window was made with the device's
     // interval (+0x9c160, 2): asking 0 from the first frame changed nothing it could see. When the device's interval is
     // not the wanted one, the applied mode is made stale so the next present applies it.
-    if (g_is_103) {
-        if (const uint64_t presenter = ld<uint64_t>(g_main + 0x12c1c48)) {
-            const uint64_t device = ld<uint64_t>(presenter);
-            const uint32_t want = target_fps() >= 60 ? 1 : 2;
-            if (device && ld<uint32_t>(device + 0x9c160) != want) st<uint32_t>(presenter + 0x508, 0xFFFFFFFFu);
-        }
+    const uint64_t presenter = g_presenter_offset ? ld<uint64_t>(g_main + g_presenter_offset) : 0;
+    if (presenter) {
+        const uint64_t device = ld<uint64_t>(presenter);
+        const uint32_t want = target_fps() >= 60 ? 1 : 2;
+        if (device && ld<uint32_t>(device + 0x9c160) != want) st<uint32_t>(presenter + 0x508, 0xFFFFFFFFu);
     }
     static int traced = 0;
     if (std::getenv("NX_NIER_TRACE_VSYNC") && traced++ < 12) {
-        const uint64_t presenter = g_is_103 ? ld<uint64_t>(g_main + 0x12c1c48) : 0;
         log("nier: vsync mode asked %u, set %u (returned %u): presenter %llx mode %u applied %u", asked,
             target_fps() >= 60 ? 0u : 1u, uint32_t(c.x[0]), (unsigned long long)presenter,
             presenter ? ld<uint32_t>(presenter + 0x504) : 0, presenter ? ld<uint32_t>(presenter + 0x508) : 0);
@@ -90,7 +99,7 @@ void resolution_floor() {
         const char* e = std::getenv("NX_NIER_MIN_SCALE");
         return std::clamp(e ? float(std::atof(e)) : 0.6f, 0.3f, 1.0f);
     }();
-    if (const uint64_t override_min = (g_main && g_is_103) ? ld<uint64_t>(g_main + 0x12c7430) : 0) {
+    if (const uint64_t override_min = (g_main && g_floor_slot_offset) ? ld<uint64_t>(g_main + g_floor_slot_offset) : 0) {
         uint32_t u;
         std::memcpy(&u, &floor, 4);
         st<uint32_t>(override_min, u);
@@ -158,35 +167,47 @@ void game::after_init() {
     const LoadedModule* m = module_at(find_symbol("nnMain"));
     if (!m) return;
     g_main = m->base;
+    auto matches = [&](uint64_t off, const uint32_t* sig, const uint32_t* mask, size_t n) {
+        if (m->info->text_size < 4 * n || off < m->info->text || off + 4 * n > m->info->text + m->info->text_size) return false;
+        for (size_t k = 0; k < n; k++)
+            if ((ld<uint32_t>(m->base + off + 4 * k) & (mask ? mask[k] : 0xffffffffu)) != sig[k]) return false;
+        return true;
+    };
     auto find_fn = [&](uint64_t hint, const uint32_t* sig, const uint32_t* mask, size_t n) -> uint64_t {
-        auto match = [&](uint64_t off) {
-            if (off < m->info->text || off + 4 * n > m->info->text + m->info->text_size) return false;
-            for (size_t k = 0; k < n; k++)
-                if ((ld<uint32_t>(m->base + off + 4 * k) & mask[k]) != sig[k]) return false;
-            return true;
-        };
-        if (match(hint)) return m->base + hint;
-        uint64_t lo = hint > 0x40000 ? std::max<uint64_t>(m->info->text, hint - 0x40000) : m->info->text;
-        uint64_t hi = std::min<uint64_t>(m->info->text + m->info->text_size - 4 * n, hint + 0x40000);
+        if (matches(hint, sig, mask, n)) return m->base + hint;
+        if (m->info->text_size < 4 * n) return 0;
+        uint64_t lo = hint > 0x80000 ? std::max<uint64_t>(m->info->text, hint - 0x80000) : m->info->text;
+        uint64_t hi = std::min<uint64_t>(m->info->text + m->info->text_size - 4 * n, hint + 0x80000);
         for (uint64_t off = lo; off <= hi; off += 4)
-            if (match(off)) return m->base + off;
+            if (matches(off, sig, mask, n)) return m->base + off;
         return 0;
     };
     const uint32_t vs_sig[6]  = {0x90000008, 0xf9400108, 0xf9400109, 0xb4000089, 0xb9050500, 0x52800020};
     const uint32_t vs_mask[6] = {0x9f00001f, 0xffc003ff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
     const uint32_t up_sig[6]  = {0xfc1d0fe8, 0xa900fbfd, 0x910023fd, 0xf9000ff5, 0xa9024ff4, 0x4ea01c08};
     const uint32_t up_mask[6] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
-    const uint32_t md_sig[6]  = {0xd10183ff, 0xa9027bfd, 0x910083fd, 0xa9035ff8, 0xa90457f6, 0xa9054ff4};
-    const uint32_t md_mask[6] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
+    // 8-instruction signature includes `ldr w8, [x5, #0xc]; tbnz w8, #0x1f` so it does not false-match earlier
+    // functions that share the 6-instruction prologue (fixes black 3D models/ships on Asia 1.0.3 and other builds).
+    const uint32_t md_sig[8]  = {0xd10183ff, 0xa9027bfd, 0x910083fd, 0xa9035ff8, 0xa90457f6, 0xa9054ff4, 0xb9400ca8, 0x37f81048};
+    const uint32_t md_mask[8] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
+    const uint32_t fl_sig[4]  = {0x90000008, 0xf9400108, 0xbd000100, 0xd65f03c0};
+    const uint32_t fl_mask[4] = {0x9f00001f, 0xffc003ff, 0xffffffff, 0xffffffff};
     uint64_t vs_addr = find_fn(0x9bf1d0, vs_sig, vs_mask, 6);
     uint64_t up_addr = find_fn(0x8fc7a8, up_sig, up_mask, 6);
-    uint64_t md_addr = find_fn(0x9d514c, md_sig, md_mask, 6);
-    g_is_103 = (vs_addr == m->base + 0x9bf1d0 && ld<uint32_t>(vs_addr) == 0xd0004808u);
+    uint64_t md_addr = matches(0x9d650c, md_sig, md_mask, 8) ? m->base + 0x9d650c : find_fn(0x9d514c, md_sig, md_mask, 8);
+    if (vs_addr) {
+        const uint64_t vs_off = vs_addr - m->base;
+        g_presenter_offset = decode_adrp_ldr(vs_off, ld<uint32_t>(vs_addr), ld<uint32_t>(vs_addr + 4));
+        if (uint64_t fl_addr = find_fn(vs_off + 0x4a0, fl_sig, fl_mask, 4))
+            g_floor_slot_offset = decode_adrp_ldr(fl_addr - m->base, ld<uint32_t>(fl_addr), ld<uint32_t>(fl_addr + 4));
+    }
     if (vs_addr) g_vsync_setter = hook_function(vs_addr, vsync_hook);
     if (up_addr) g_update = hook_function(up_addr, update_hook);
     if (!g_vsync_setter || !g_update) log("nier: frame-rate hooks not installed (%llx %llx)", (unsigned long long)g_vsync_setter,
                                           (unsigned long long)g_update);
-    if (md_addr && !(g_mesh_draw = hook_function(md_addr, mesh_draw_hook))) log("nier: mesh draw hook not installed");
+    if (md_addr) g_mesh_draw = hook_function(md_addr, mesh_draw_hook);
+    if (!g_mesh_draw) log("nier: mesh draw hook not installed (offset %#llx)",
+                          (unsigned long long)(md_addr ? md_addr - m->base : 0));
 }
 
 }  // namespace nx

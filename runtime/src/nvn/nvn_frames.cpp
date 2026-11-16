@@ -146,7 +146,18 @@ uint64_t g_spill_size = 0, g_spill_used = 0;
 // Images of destroyed textures, with the serial of the last submit that may still use them.
 std::mutex g_grave_lock;
 std::vector<std::pair<uint64_t, std::shared_ptr<GpuImage>>> g_grave;
-std::vector<std::tuple<uint64_t, VkBuffer, VkDeviceMemory>> g_staging;  // staging_alloc's, freed like the grave's
+struct StagingEntry {
+    uint64_t serial = 0;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint8_t* ptr = nullptr;
+    uint64_t cap = 0;
+    bool reusable = false;  // true for kUploadUsage spill buffers; staging_alloc is TRANSFER_SRC only
+};
+std::vector<StagingEntry> g_staging;       // active staging/spill buffers in flight
+std::vector<StagingEntry> g_staging_pool;  // retired kUploadUsage spill buffers kept mapped for reuse
+uint64_t g_staging_pool_bytes = 0;
+constexpr uint64_t kMaxStagingPoolBytes = 48ull << 20;
 
 // GPU-written images of destroyed textures, kept a few submits for a new texture over the same memory with the same
 // shape. Wonder re-creates ~180 NVNtexture objects per frame over the same render-target memory: each got a new
@@ -692,6 +703,30 @@ Upload frame_upload_alloc(uint64_t size, uint64_t align) {
         }
 #endif
         uint64_t cap = std::max<uint64_t>((sz + al + 0xFFFFFull) & ~0xFFFFFull, 16ull << 20);
+        StagingEntry reused{};
+        {
+            std::lock_guard lk(g_grave_lock);
+            size_t best = SIZE_MAX;
+            for (size_t i = 0; i < g_staging_pool.size(); i++) {
+                if (g_staging_pool[i].cap >= cap &&
+                    (best == SIZE_MAX || g_staging_pool[i].cap < g_staging_pool[best].cap)) {
+                    best = i;
+                }
+            }
+            if (best != SIZE_MAX) {
+                reused = g_staging_pool[best];
+                g_staging_pool_bytes -= reused.cap;
+                g_staging_pool.erase(g_staging_pool.begin() + best);
+                reused.serial = g_submitted + 1;
+                g_staging.push_back(reused);
+            }
+        }
+        if (reused.ptr) {
+            g_spill_buf = reused.buffer, g_spill_ptr = reused.ptr, g_spill_size = reused.cap, g_spill_used = sz;
+            log("nvn/vk: upload ring full (%llu MB in this submit): reused %llu MB spill buffer",
+                (unsigned long long)((g_head - g_begin) >> 20), (unsigned long long)(reused.cap >> 20));
+            return {g_spill_buf, 0, g_spill_ptr};
+        }
         VkDevice d = vk_device();
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bi.size = cap;
@@ -714,7 +749,7 @@ Upload frame_upload_alloc(uint64_t size, uint64_t align) {
         }
         {
             std::lock_guard lk(g_grave_lock);
-            g_staging.push_back({g_submitted + 1, buffer, memory});
+            g_staging.push_back({g_submitted + 1, buffer, memory, static_cast<uint8_t*>(p), cap, true});
         }
         g_staging_count++, g_staging_bytes += cap;
         g_spill_buf = buffer, g_spill_ptr = static_cast<uint8_t*>(p), g_spill_size = cap, g_spill_used = sz;
@@ -853,8 +888,15 @@ void free_retired_images(uint64_t completed) {
     {
         std::lock_guard lk(g_grave_lock);
         auto done = std::stable_partition(g_staging.begin(), g_staging.end(),
-                                          [&](const auto& e) { return std::get<0>(e) > completed; });
-        for (auto it = done; it != g_staging.end(); ++it) staging.push_back({std::get<1>(*it), std::get<2>(*it)});
+                                          [&](const StagingEntry& e) { return e.serial > completed; });
+        for (auto it = done; it != g_staging.end(); ++it) {
+            if (it->reusable && g_staging_pool_bytes + it->cap <= kMaxStagingPoolBytes) {
+                g_staging_pool_bytes += it->cap;
+                g_staging_pool.push_back(*it);
+            } else {
+                staging.push_back({it->buffer, it->memory});
+            }
+        }
         g_staging.erase(done, g_staging.end());
     }
     for (auto& [b, m] : staging) p_vkDestroyBuffer(vk_device(), b, nullptr), p_vkFreeMemory(vk_device(), m, nullptr);
@@ -911,7 +953,7 @@ Upload staging_alloc(uint64_t size) {
         return upload_alloc(size, 16);
     }
     std::lock_guard lk(g_grave_lock);
-    g_staging.push_back({g_submitted + 1, buffer, memory});
+    g_staging.push_back({g_submitted + 1, buffer, memory, static_cast<uint8_t*>(p), size, false});
     return {buffer, 0, static_cast<uint8_t*>(p)};
 }
 
