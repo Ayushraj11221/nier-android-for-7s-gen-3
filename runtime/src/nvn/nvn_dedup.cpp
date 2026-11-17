@@ -112,7 +112,7 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
     return u;
 }
 
-void dedup_reset() { g_copies.clear(), g_generation++; }
+void dedup_reset() { g_copies.clear(), g_generation++, index_range_reset(); }
 
 void dedup_invalidate(const uint8_t* p, uint64_t size) {
     // Entries starting before p may still reach into it: look back over the few that can.

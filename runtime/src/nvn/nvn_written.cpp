@@ -7,6 +7,7 @@
 // command order); each range is written back once. NX_COMPUTE_SEPARATE=1: the previous behaviour.
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -447,6 +448,91 @@ bool written_indirect(VkCommandBuffer cb, const uint8_t* p) {
     return true;
 }
 
+// Smallest and largest index of `count` indices of `isz` bytes, the restart value (all ones) skipped; false when every
+// index is a restart. The restart value is the largest of its size, so the minimum can include it, and the maximum
+// reads it as 0: no branch in the loop, and NEON takes 8 (16-bit) or 4 (32-bit) indices at a time.
+static bool index_minmax(const uint8_t* p, uint32_t count, uint32_t isz, uint32_t& mn_out, uint32_t& mx_out) {
+    uint32_t mn = UINT32_MAX, mx = 0, k = 0;
+    if (isz == 2) {
+        const uint16_t* q = reinterpret_cast<const uint16_t*>(p);
+        uint32_t smn = 0xFFFF, smx = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+        uint16x8_t vmn = vdupq_n_u16(0xFFFF), vmx = vdupq_n_u16(0), rs = vdupq_n_u16(0xFFFF);
+        for (; k + 8 <= count; k += 8) {
+            uint16x8_t v = vld1q_u16(q + k);
+            vmn = vminq_u16(vmn, v);
+            vmx = vmaxq_u16(vmx, vbicq_u16(v, vceqq_u16(v, rs)));
+        }
+        smn = vminvq_u16(vmn), smx = vmaxvq_u16(vmx);
+#endif
+        for (; k < count; k++) {
+            uint32_t v = q[k];
+            smn = std::min(smn, v), smx = std::max(smx, v == 0xFFFF ? 0u : v);
+        }
+        if (smn == 0xFFFF) return false;  // only restarts (or nothing but the restart value)
+        mn = smn, mx = smx;
+    } else if (isz != 1) {  // 4 (any size but 1 and 2 was read as 32-bit before)
+        const uint32_t* q = reinterpret_cast<const uint32_t*>(p);
+        uint32_t smn = 0xFFFFFFFFu, smx = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+        uint32x4_t vmn = vdupq_n_u32(0xFFFFFFFFu), vmx = vdupq_n_u32(0), rs = vdupq_n_u32(0xFFFFFFFFu);
+        for (; k + 4 <= count; k += 4) {
+            uint32x4_t v = vld1q_u32(q + k);
+            vmn = vminq_u32(vmn, v);
+            vmx = vmaxq_u32(vmx, vbicq_u32(v, vceqq_u32(v, rs)));
+        }
+        smn = vminvq_u32(vmn), smx = vmaxvq_u32(vmx);
+#endif
+        for (; k < count; k++) {
+            uint32_t v = q[k];
+            smn = std::min(smn, v), smx = std::max(smx, v == 0xFFFFFFFFu ? 0u : v);
+        }
+        if (smn == 0xFFFFFFFFu) return false;
+        mn = smn, mx = smx;
+    } else {
+        for (; k < count; k++) {
+            uint32_t v = p[k];
+            if (v == 0xFF) continue;
+            mn = std::min(mn, v), mx = std::max(mx, v);
+        }
+        if (mn == UINT32_MAX) return false;
+    }
+    mn_out = mn, mx_out = mx;
+    return true;
+}
+
+// The index range of a draw is asked for by draw_inputs and again by draw_inputs_shared, and the z-prepass, shadow
+// and colour passes of an object bind the same index list: one scan per submit and (address, count, size).
+// NX_INDEX_RANGE_CACHE=0: a scan per ask as before. Dropped at each submit (dedup_reset: the guest may have changed
+// the bytes since) and not used for bytes a dispatch of this submit writes.
+namespace {
+struct IndexRangeSlot {
+    const uint8_t* p = nullptr;
+    uint64_t gen = 0;
+    uint32_t count = 0, isz = 0, mn = 0, mx = 0;
+    bool any = false;
+};
+constexpr uint32_t kIndexRangeSlots = 1024;  // direct mapped
+IndexRangeSlot g_index_range[kIndexRangeSlots];
+uint64_t g_index_range_gen = 1;
+}  // namespace
+
+void index_range_reset() { g_index_range_gen++; }
+
+static bool cached_index_minmax(const uint8_t* p, uint32_t count, uint32_t isz, uint32_t& mn, uint32_t& mx) {
+    static const bool cache = !(std::getenv("NX_INDEX_RANGE_CACHE") && std::getenv("NX_INDEX_RANGE_CACHE")[0] == '0');
+    if (!cache || written_overlaps(p, uint64_t(count) * isz)) return index_minmax(p, count, isz, mn, mx);
+    IndexRangeSlot& s = g_index_range[((reinterpret_cast<uintptr_t>(p) >> 1) ^ (uint64_t(count) * 0x9E3779B1u)) %
+                                      kIndexRangeSlots];
+    if (s.gen == g_index_range_gen && s.p == p && s.count == count && s.isz == isz) {
+        mn = s.mn, mx = s.mx;
+        return s.any;
+    }
+    s.any = index_minmax(p, count, isz, mn, mx);
+    s.gen = g_index_range_gen, s.p = p, s.count = count, s.isz = isz, s.mn = s.any ? mn : 0, s.mx = s.any ? mx : 0;
+    return s.any;
+}
+
 // The vertices [lo, hi] and the last instance a draw fetches; false when unknown (no count, no indices).
 static bool fetched_range(bool indexed, const Cmd& c, uint64_t& lo, uint64_t& hi, uint64_t& inst_lo, uint64_t& inst_hi) {
     uint32_t count = uint32_t(indexed ? c.i[0] : c.i[1]);
@@ -454,14 +540,9 @@ static bool fetched_range(bool indexed, const Cmd& c, uint64_t& lo, uint64_t& hi
     if (indexed) {
         const uint8_t* p = guest_bytes(c.a[0]);
         if (!p) return false;
-        uint32_t isz = index_size(c.mask), restart = isz == 1 ? 0xFF : isz == 2 ? 0xFFFF : 0xFFFFFFFFu;
+        uint32_t isz = index_size(c.mask);
         uint32_t mn = UINT32_MAX, mx = 0;
-        for (uint32_t k = 0; k < count; k++) {
-            uint32_t v = isz == 1 ? p[k] : isz == 2 ? reinterpret_cast<const uint16_t*>(p)[k] : reinterpret_cast<const uint32_t*>(p)[k];
-            if (v == restart) continue;
-            mn = std::min(mn, v), mx = std::max(mx, v);
-        }
-        if (mn == UINT32_MAX || int64_t(mn) + c.i[1] < 0) return false;
+        if (!cached_index_minmax(p, count, isz, mn, mx) || int64_t(mn) + c.i[1] < 0) return false;
         lo = uint64_t(int64_t(mn) + c.i[1]), hi = uint64_t(int64_t(mx) + c.i[1]);
     } else {
         lo = uint32_t(c.i[0]), hi = uint64_t(uint32_t(c.i[0])) + count - 1;

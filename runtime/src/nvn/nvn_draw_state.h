@@ -111,6 +111,7 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
 void cache_begin_submit();  // frees the copies retired submits read
 void cache_log();
 void dedup_reset();                                     // at each submit
+void index_range_reset();                               // nvn_written.cpp: the index ranges scanned this submit are dropped
 void dedup_invalidate(const uint8_t* p, uint64_t size);  // guest bytes written during the replay
 void dedup_log();
 // nvn_written.cpp: compute results within a submit (docs/nvn/GLITCH-PLAN.md G5), one copy per written guest range.
