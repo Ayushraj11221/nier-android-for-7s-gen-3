@@ -6,7 +6,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.nierrecomp"
     android:versionCode="10"
-    android:versionName="0.2.10">
+    android:versionName="0.2.11">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
@@ -45,9 +45,9 @@
             android:theme="@style/Fullscreen"
             android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden" />
-        <!-- The game. Exported: test runs can start it directly with adb. -->
+        <!-- The game (GameActivity: a NativeActivity with a Menu button that offers Exit). Exported: test runs can start it with adb. -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".GameActivity"
             android:exported="true"
             android:screenOrientation="sensorLandscape"
             android:resizeableActivity="false"

@@ -576,7 +576,7 @@ public class Launcher extends Activity {
                 }
                 SaveFiles.convertExistingSaves();
                 save();
-                startActivity(new Intent(Launcher.this, android.app.NativeActivity.class));
+                startActivity(new Intent(Launcher.this, GameActivity.class));
             }
         });
 

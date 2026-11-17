@@ -82,6 +82,15 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src mcr.microsoft.com/dotnet/sdk:10.0 sh games/nier/tools/build_harness_android.sh
           sudo chown -R "$USER" private
 
+      - name: Fetch libopus 1.5.2 (hwopus decodes the game's Opus sound effects and voices with it)
+        run: |
+          set -e
+          mkdir -p private/third_party/opus-1.5.2
+          curl -fL --retry 5 --retry-delay 5 https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz -o "$RUNNER_TEMP/opus.tar.gz"
+          sha256sum "$RUNNER_TEMP/opus.tar.gz"
+          tar -xz -f "$RUNNER_TEMP/opus.tar.gz" -C private/third_party/opus-1.5.2 --strip-components=1
+          test -f private/third_party/opus-1.5.2/CMakeLists.txt
+
       - name: Build the NieR APK
         env:
           NIER_KS_PASS: ${{ secrets.NIER_KS_PASS }}
