@@ -723,8 +723,10 @@ Upload frame_upload_alloc(uint64_t size, uint64_t align) {
         }
         if (reused.ptr) {
             g_spill_buf = reused.buffer, g_spill_ptr = reused.ptr, g_spill_size = reused.cap, g_spill_used = sz;
-            log("nvn/vk: upload ring full (%llu MB in this submit): reused %llu MB spill buffer",
-                (unsigned long long)((g_head - g_begin) >> 20), (unsigned long long)(reused.cap >> 20));
+            char kinds[192];
+            replay::dedup_submit_breakdown(kinds, sizeof kinds);
+            log("nvn/vk: upload ring full (%llu MB in this submit): reused %llu MB spill buffer [copied so far: %s]",
+                (unsigned long long)((g_head - g_begin) >> 20), (unsigned long long)(reused.cap >> 20), kinds);
             return {g_spill_buf, 0, g_spill_ptr};
         }
         VkDevice d = vk_device();
@@ -753,8 +755,10 @@ Upload frame_upload_alloc(uint64_t size, uint64_t align) {
         }
         g_staging_count++, g_staging_bytes += cap;
         g_spill_buf = buffer, g_spill_ptr = static_cast<uint8_t*>(p), g_spill_size = cap, g_spill_used = sz;
-        log("nvn/vk: upload ring full (%llu MB in this submit): spilled %llu MB",
-            (unsigned long long)((g_head - g_begin) >> 20), (unsigned long long)(cap >> 20));
+        char kinds[192];
+        replay::dedup_submit_breakdown(kinds, sizeof kinds);
+        log("nvn/vk: upload ring full (%llu MB in this submit): spilled %llu MB [copied so far: %s]",
+            (unsigned long long)((g_head - g_begin) >> 20), (unsigned long long)(cap >> 20), kinds);
         return {g_spill_buf, 0, g_spill_ptr};
     };
     if (g_spill_buf) {

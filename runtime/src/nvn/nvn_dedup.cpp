@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -49,6 +50,28 @@ struct KindStats {
 };
 KindStats g_kind[kUploadKinds];
 std::unordered_map<const uint8_t*, std::pair<uint64_t, uint64_t>> g_last_hash;  // address -> (size, hash)
+
+// Always on (a few adds per copy): the bytes this submit copied into the ring, per kind. The spill lines of
+// nvn_frames.cpp say what a huge submit is made of (dedup_submit_breakdown).
+uint64_t g_submit_kind_bytes[kUploadKinds] = {};
+
+// NX_UPLOAD_STATS: how the copies are sized, and how much a cache of 4 KB pages (instead of whole ranges) could save.
+// A page (guest address, 4 KB, whole pages inside a copy only) is: repeated inside the submit (an overlapping range
+// already copied it), the same as the last submit that copied it, changed since, or seen for the first time.
+constexpr int kSizeBuckets = 5;  // <= 4 KB, 64 KB, 1 MB, 4 MB, more
+struct SizeHist {
+    uint64_t n[kSizeBuckets] = {}, bytes[kSizeBuckets] = {};
+};
+SizeHist g_hist[kUploadKinds];
+struct PageStats {
+    uint64_t first = 0, dup = 0, same = 0, changed = 0;
+};
+PageStats g_pages[kUploadKinds];
+struct PageSeen {
+    uint64_t hash = 0, submit = 0;
+};
+std::unordered_map<uintptr_t, PageSeen> g_page_seen;
+int size_bucket(uint64_t s) { return s <= 4096 ? 0 : s <= (64u << 10) ? 1 : s <= (1u << 20) ? 2 : s <= (4u << 20) ? 3 : 4; }
 struct VertexSource {
     uint64_t bytes = 0, copies = 0, size = 0;
 };
@@ -69,6 +92,19 @@ void count_copy(const uint8_t* p, uint64_t size) {
     if (g_upload_kind == kUploadVertex) {  // which vertex buffers the bytes come from (top list in dedup_log)
         auto& v = g_vertex_by_addr[p];
         v.bytes += size, v.copies++, v.size = size;
+    }
+    const int kind = g_upload_kind < kUploadKinds ? g_upload_kind : kUploadOther;
+    const int b = size_bucket(size);
+    g_hist[kind].n[b]++, g_hist[kind].bytes[b] += size;
+    const uintptr_t end = (uintptr_t(p) + size) & ~uintptr_t(4095);
+    for (uintptr_t a = (uintptr_t(p) + 4095) & ~uintptr_t(4095); a < end; a += 4096) {
+        const uint64_t ph = hash_memory(reinterpret_cast<const uint8_t*>(a), 4096);
+        PageSeen& ps = g_page_seen[a];
+        if (ps.submit == g_generation) g_pages[kind].dup++;
+        else if (ps.submit == 0) g_pages[kind].first++;
+        else if (ps.hash == ph) g_pages[kind].same++;
+        else g_pages[kind].changed++;
+        ps.hash = ph, ps.submit = g_generation;
     }
 }
 
@@ -109,10 +145,28 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
     g_copies[p] = {size, padded, u};
     f = {p, g_generation, {size, padded, u}};
     g_copied += padded;
+    g_submit_kind_bytes[g_upload_kind < kUploadKinds ? g_upload_kind : kUploadOther] += padded;
     return u;
 }
 
-void dedup_reset() { g_copies.clear(), g_generation++, index_range_reset(); }
+void dedup_reset() {
+    g_copies.clear(), g_generation++, index_range_reset();
+    for (uint64_t& b : g_submit_kind_bytes) b = 0;
+}
+
+// "vertex 120 MB, index 5 MB, ...": what this submit has copied into the ring so far (not the textures or the
+// written blocks, which take other paths: the difference to the ring's own count is theirs).
+void dedup_submit_breakdown(char* out, size_t n) {
+    static const char* names[kUploadKinds] = {"other", "vertex", "index", "uniform/storage"};
+    size_t at = 0;
+    if (n) out[0] = 0;
+    for (int k = 0; k < kUploadKinds && at + 1 < n; k++) {
+        const int w = std::snprintf(out + at, n - at, "%s%s %.0f MB", at ? ", " : "", names[k],
+                                    double(g_submit_kind_bytes[k]) / 1e6);
+        if (w < 0) break;
+        at += size_t(w);
+    }
+}
 
 void dedup_invalidate(const uint8_t* p, uint64_t size) {
     // Entries starting before p may still reach into it: look back over the few that can.
@@ -163,6 +217,25 @@ void dedup_log() {
                 (unsigned long long)s.copies, double(s.bytes) / 1e6, 100.0 * double(s.same) / double(s.bytes));
         s = {};
     }
+    for (int k = 0; k < kUploadKinds; k++) {
+        const SizeHist& h = g_hist[k];
+        uint64_t total = 0;
+        for (int b = 0; b < kSizeBuckets; b++) total += h.n[b];
+        if (total)
+            log("nvn: copy sizes of %s: <=4K %llu (%.1f MB), <=64K %llu (%.1f MB), <=1M %llu (%.1f MB), <=4M %llu (%.1f MB), "
+                "more %llu (%.1f MB)", names[k], (unsigned long long)h.n[0], double(h.bytes[0]) / 1e6,
+                (unsigned long long)h.n[1], double(h.bytes[1]) / 1e6, (unsigned long long)h.n[2], double(h.bytes[2]) / 1e6,
+                (unsigned long long)h.n[3], double(h.bytes[3]) / 1e6, (unsigned long long)h.n[4], double(h.bytes[4]) / 1e6);
+        const PageStats& ps = g_pages[k];
+        const uint64_t pages = ps.first + ps.dup + ps.same + ps.changed;
+        if (pages)
+            log("nvn: 4 KB pages of %s copies: %.1f MB; %.0f%% repeated inside the submit, %.0f%% the same as the last submit "
+                "that copied them, %.0f%% changed, %.0f%% first seen", names[k], double(pages) * 4096.0 / 1e6,
+                100.0 * double(ps.dup) / double(pages), 100.0 * double(ps.same) / double(pages),
+                100.0 * double(ps.changed) / double(pages), 100.0 * double(ps.first) / double(pages));
+        g_hist[k] = {}, g_pages[k] = {};
+    }
+    if (g_page_seen.size() > (1u << 20)) g_page_seen.clear();  // 4 GB of pages: start over
     if (!g_vertex_by_addr.empty()) {
         std::vector<std::pair<const uint8_t*, VertexSource>> top(g_vertex_by_addr.begin(), g_vertex_by_addr.end());
         std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.second.bytes > y.second.bytes; });
