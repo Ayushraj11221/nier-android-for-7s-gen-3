@@ -61,6 +61,7 @@ constexpr uint64_t kStaleSubmits = 600;                // a window nobody asked 
 constexpr uint64_t kStreamingSubmits = 240;            // a streaming window stays in the ring this long
 constexpr uint64_t kJudgeSubmits = 300;                // the self-check runs this often
 constexpr uint64_t kOffSubmits = 1800;                 // and switches the cache off for this long when it loses
+constexpr uint64_t kJudgeMinBytes = 32ull << 20;          // the self-check needs this much served to judge
 constexpr double kRingNsPerByte = 0.30;                // what a ring copy costs (0.34-0.42 ms per MB measured)
 
 struct Mirror {
@@ -283,6 +284,7 @@ void count_mismatch(const Window& w, const Mirror& m, uint32_t a0, uint32_t a1, 
 void judge() {
     if (g_submits < g_judged_at + kJudgeSubmits) return;
     g_judged_at = g_submits;
+    if (g_judge_bytes < kJudgeMinBytes) return;  // too little served to tell (a menu): keep adding up
     // What the mirrors cost (hashing and copying pages) against what the ring copies of the bytes they served would have.
     const double saved = double(g_judge_bytes) * kRingNsPerByte;
     if (g_judge_bytes && double(g_judge_ns) > saved) {
