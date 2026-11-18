@@ -72,7 +72,8 @@ public class GameActivity extends NativeActivity {
         }
         try {
             float d = getResources().getDisplayMetrics().density;
-            TextView b = new TextView(this);
+            final float density = d;
+            final TextView b = new TextView(this);
             b.setText(Lang.t("MENÚ", "MENU"));
             b.setTextColor(Color.WHITE);
             b.setTextSize(11);
@@ -84,21 +85,55 @@ public class GameActivity extends NativeActivity {
             bg.setCornerRadius(10 * d);
             b.setBackground(bg);
             b.setAlpha(0.65f);
-            b.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    showExitDialog();
-                }
-            });
-            WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+            final WindowManager wm = getWindowManager();
+            final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                     WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
                     WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                     PixelFormat.TRANSLUCENT);
             lp.token = decor.getWindowToken();
-            lp.gravity = Gravity.START | Gravity.CENTER_VERTICAL;  // the left edge, middle: no game button there
+            lp.gravity = Gravity.TOP | Gravity.START;  // top-left corner by default
+            lp.x = (int) (16 * d);
+            lp.y = (int) (16 * d);
             lp.setTitle("NieR menu");
-            getWindowManager().addView(b, lp);
+            b.setOnTouchListener(new View.OnTouchListener() {
+                private int initialX, initialY;
+                private float initialTouchX, initialTouchY;
+                private boolean isMove;
+
+                @Override
+                public boolean onTouch(View v, android.view.MotionEvent event) {
+                    switch (event.getAction()) {
+                        case android.view.MotionEvent.ACTION_DOWN:
+                            initialX = lp.x;
+                            initialY = lp.y;
+                            initialTouchX = event.getRawX();
+                            initialTouchY = event.getRawY();
+                            isMove = false;
+                            return true;
+                        case android.view.MotionEvent.ACTION_MOVE:
+                            float dx = event.getRawX() - initialTouchX;
+                            float dy = event.getRawY() - initialTouchY;
+                            if (Math.hypot(dx, dy) > 8 * density) {
+                                isMove = true;
+                                lp.x = initialX + (int) dx;
+                                lp.y = initialY + (int) dy;
+                                try {
+                                    wm.updateViewLayout(b, lp);
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                            return true;
+                        case android.view.MotionEvent.ACTION_UP:
+                            if (!isMove) {
+                                showExitDialog();
+                            }
+                            return true;
+                    }
+                    return false;
+                }
+            });
+            wm.addView(b, lp);
             menuButton = b;
         } catch (Throwable t) {
             menuButton = null;
