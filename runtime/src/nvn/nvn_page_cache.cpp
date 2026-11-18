@@ -2,13 +2,18 @@
 // keys on an exact address + size + hash and skips ranges over 4 MB, and NieR's trimmed vertex ranges change size from
 // draw to draw, so it never got a hit worth having).
 //
-// Here the unit is a 4 KB page of guest memory, not a range. Guest memory is cut into windows of 4 MB on a 2 MB grid:
-// any range of up to 2 MB lies inside one window. A window has up to three mirrors (host-visible Vulkan buffers of the
+// Here the unit is a 4 KB page of guest memory, not a range. Guest memory is cut into windows of 512 KB on a 256 KB grid:
+// any range of up to 256 KB lies inside one window (the first run on the phone: ranges averaged 62 KB, and 4 MB windows
+// ran the arena out: 144 windows touched in 300 frames against 32 slots). A window has up to three mirrors (host-visible Vulkan buffers of the
 // window's size, carved from one arena buffer and laid out like guest memory), each with the hash of every page it holds. A draw that needs [p, p+size)
 // hashes the guest pages it covers (CRC32 instructions, once per page per submit) and binds a mirror whose pages all
 // match: no byte is copied into the upload ring. If none matches, the mirror the GPU is done with that differs least is
 // brought up to date (only the pages that differ are copied); if every mirror is still in flight the range goes to the
 // ring as before. A mirror is never written while a submit that read it is recording or running, hence several.
+//
+// A page no mirror has copied yet is never read by a submit, so it can be filled into a mirror at any time, even one a
+// running submit reads; only a page whose bytes changed needs an idle mirror. (The first version filled new pages into
+// whichever mirror was idle and spread a window over all three, then found them all in flight.)
 //
 // Pages that change nearly every time they are asked for (effect vertex buffers the CPU rewrites each frame) mark their
 // window "streaming" for a while: it goes to the ring. The cache also times itself and switches itself off when hashing
@@ -46,11 +51,12 @@ using namespace nx::vk;
 namespace {
 
 constexpr uint64_t kPage = 4096;
-constexpr uint64_t kGrid = 2ull << 20;                 // windows start on this grid ...
-constexpr uint64_t kWindow = 4ull << 20;               // ... and are this long: a range of up to kGrid fits in one
-constexpr uint32_t kPages = uint32_t(kWindow / kPage);  // 1024
+constexpr uint64_t kGrid = 256ull << 10;               // windows start on this grid ...
+constexpr uint64_t kWindow = 512ull << 10;              // ... and are this long: a range of up to kGrid fits in one
+constexpr uint32_t kPages = uint32_t(kWindow / kPage);  // 128
 constexpr uint64_t kMinRange = 16 << 10;               // smaller ranges: the ring copy is cheaper than a page's hash
 constexpr uint32_t kVersions = 3;                      // mirrors per window (frames in flight + the one recording)
+constexpr uint64_t kEvictAfter = 30;                    // a window asked for more recently keeps its mirrors when the arena is full
 constexpr uint64_t kStaleSubmits = 600;                // a window nobody asked for in this long is freed
 constexpr uint64_t kStreamingSubmits = 240;            // a streaming window stays in the ring this long
 constexpr uint64_t kJudgeSubmits = 300;                // the self-check runs this often
@@ -61,8 +67,7 @@ struct Mirror {
     int32_t slot = -1;      // the arena slot (kWindow bytes at slot * kWindow); -1: no mirror
     uint8_t* ptr = nullptr;  // the slot's bytes
     uint64_t last_use = 0;  // the serial of the last submit that bound it (0: never)
-    uint64_t hash[kPages];  // hash of each page it holds; 0: not holding it (a real hash always has bit 0 set)
-    Mirror() { std::memset(hash, 0, sizeof hash); }
+    std::vector<uint64_t> hash;  // kPages entries: the hash of each page it holds; 0: never copied (a real hash has bit 0 set)
     bool exists() const { return slot >= 0; }
 };
 
@@ -101,7 +106,9 @@ struct {
     uint64_t cold_pages = 0, changed_pages = 0, copied_bytes = 0;
     uint64_t hash_ns = 0, copy_ns = 0, hashed_pages = 0;
     uint64_t in_flight = 0, streaming = 0, no_memory = 0, wrong = 0;
+    uint64_t small = 0, small_bytes = 0, big = 0, big_bytes = 0;  // ranges outside [kMinRange, kGrid]: the ring
 } g_pc_stats;
+uint64_t g_full_at = 0;  // g_submits when the arena had no free slot and nothing to free
 
 bool on() {
     static const bool v = [] {
@@ -131,11 +138,15 @@ uint64_t budget() {
 __attribute__((target("crc"))) uint64_t page_hash_crc(const uint8_t* p) {
     const uint64_t* q = reinterpret_cast<const uint64_t*>(p);
     uint32_t c0 = 0x11111111u, c1 = 0x22222222u, c2 = 0x33333333u, c3 = 0x44444444u;
-    for (int i = 0; i < 128; i++) {
-        c0 = __crc32cd(c0, q[i]);
-        c1 = __crc32cd(c1, q[128 + i]);
-        c2 = __crc32cd(c2, q[256 + i]);
-        c3 = __crc32cd(c3, q[384 + i]);
+    for (int i = 0; i < 128; i += 8) {
+        __builtin_prefetch(q + i + 64), __builtin_prefetch(q + 128 + i + 64);  // 512 bytes ahead in each stream
+        __builtin_prefetch(q + 256 + i + 64), __builtin_prefetch(q + 384 + i + 64);
+        for (int k = 0; k < 8; k++) {
+            c0 = __crc32cd(c0, q[i + k]);
+            c1 = __crc32cd(c1, q[128 + i + k]);
+            c2 = __crc32cd(c2, q[256 + i + k]);
+            c3 = __crc32cd(c3, q[384 + i + k]);
+        }
     }
     const uint64_t a = (uint64_t(c0) << 32) | c1, b = (uint64_t(c2) << 32) | c3;
     return (a ^ (b * 0x9E3779B97F4A7C15ull)) | 1;
@@ -183,8 +194,8 @@ bool ensure_arena() {
     g_arena.slots = uint32_t(bytes / kWindow);
     for (uint32_t k = 0; k < g_arena.slots; k++) g_arena.free_slots.push_back(k);
     g_arena.failed = false;
-    log("nvn: page cache: arena of %llu MB (%u slots of %llu MB)", (unsigned long long)(bytes >> 20), g_arena.slots,
-        (unsigned long long)(kWindow >> 20));
+    log("nvn: page cache: arena of %llu MB (%u slots of %llu KB)", (unsigned long long)(bytes >> 20), g_arena.slots,
+        (unsigned long long)(kWindow >> 10));
     return true;
 }
 
@@ -199,7 +210,7 @@ bool take_slot(Mirror& m, uint64_t at, uint64_t min_off) {
     m.slot = int32_t(g_arena.free_slots[best]);
     m.ptr = g_arena.ptr + uint64_t(m.slot) * kWindow;
     m.last_use = 0;
-    std::memset(m.hash, 0, sizeof m.hash);
+    m.hash.assign(kPages, 0);
     g_arena.free_slots.erase(g_arena.free_slots.begin() + best);
     g_mirror_bytes += kWindow;
     return true;
@@ -222,7 +233,7 @@ bool make_room(const Window* keep, uint64_t rec, uint64_t done) {
     Window* best = nullptr;
     for (auto& kv : g_windows) {
         Window& w = kv.second;
-        if (&w == keep) continue;
+        if (&w == keep || w.touched + kEvictAfter > g_submits) continue;  // not one asked for lately: that would thrash
         bool idle = false;
         for (Mirror& m : w.mirror) idle |= m.exists() && mirror_idle(m, rec, done);
         if (idle && (!best || w.touched < best->touched)) best = &w;
@@ -260,10 +271,13 @@ uint32_t update_mirror(Window& w, Mirror& m, const uint8_t* base, uint32_t a0, u
     return copied;
 }
 
-uint32_t mismatches(const Window& w, const Mirror& m, uint32_t a0, uint32_t a1) {
-    uint32_t n = 0;
-    for (uint32_t i = a0; i < a1; i++) n += m.hash[i] != w.guest_hash[i];
-    return n;
+// Pages [a0, a1) the mirror holds with other bytes (`changed`) and pages it has never copied (`cold`).
+void count_mismatch(const Window& w, const Mirror& m, uint32_t a0, uint32_t a1, uint32_t& changed, uint32_t& cold) {
+    changed = cold = 0;
+    for (uint32_t i = a0; i < a1; i++) {
+        if (m.hash[i] == w.guest_hash[i]) continue;
+        (m.hash[i] ? changed : cold)++;
+    }
 }
 
 void judge() {
@@ -315,7 +329,15 @@ void page_cache_invalidate(const uint8_t* p, uint64_t size) {
 }
 
 bool page_cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out) {
-    if (!on() || !p || size < kMinRange || size > kGrid || g_submits < g_off_until || g_submits == 0) return false;
+    if (!on() || !p || g_submits == 0 || g_submits < g_off_until) return false;
+    if (size < kMinRange) {
+        g_pc_stats.small++, g_pc_stats.small_bytes += size;
+        return false;
+    }
+    if (size > kGrid) {
+        g_pc_stats.big++, g_pc_stats.big_bytes += size;
+        return false;
+    }
     if (uintptr_t(p) % (align ? align : 1) != 0 || padded < size) return false;  // the offset in the mirror keeps p's
     const uint64_t min_off = g_upload_min_offset;  // the caller binds at (offset - min_off): not below zero
     const uint64_t win = uintptr_t(p) / kGrid;
@@ -331,8 +353,16 @@ bool page_cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_
     const uint32_t a0 = uint32_t(at / kPage), a1 = uint32_t((at + size - 1) / kPage + 1);
     const uint64_t rec = frame_recording_serial(), done = completed_serial();
 
+    // No mirror of this window and the arena is full this submit: nothing can be served, so no hashing either.
+    bool has_mirror = false;
+    for (const Mirror& m : w.mirror) has_mirror |= m.exists();
+    if (!has_mirror && g_full_at == g_submits) {
+        g_pc_stats.no_memory++;
+        return false;
+    }
+
     // The guest pages' hashes (once per page per submit, until a write of the guest invalidates them).
-    uint64_t t0 = plat::monotonic_ns();
+    const uint64_t t0 = plat::monotonic_ns();
     for (uint32_t i = a0; i < a1; i++) {
         if (w.guest_gen[i] == g_gen) continue;
         w.guest_hash[i] = page_hash(base + uint64_t(i) * kPage);
@@ -341,58 +371,57 @@ bool page_cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_
     }
     const uint64_t hash_ns = plat::monotonic_ns() - t0;
     g_pc_stats.hash_ns += hash_ns;
-    uint64_t cost_ns = hash_ns;
+    g_judge_ns += hash_ns;  // counted whether or not the range ends up in a mirror: wasted hashing is a cost
 
-    // A mirror that already holds every page: bound as it is.
+    // 1. A mirror holding no changed page: bound as it is, never-used pages filled into it first. Never-used pages are
+    //    read by no submit, so this is safe while the mirror is in flight. The fewest pages to fill wins.
+    // 2. Else the idle mirror that differs least: changed pages are overwritten, so no submit may still read it.
     Mirror* chosen = nullptr;
-    uint32_t chosen_miss = 0;
+    uint32_t chosen_changed = 0, chosen_cold = 0, best_cold = UINT32_MAX, idle_cost = UINT32_MAX;
+    Mirror* idle = nullptr;
+    uint32_t idle_changed = 0, idle_cold = 0;
     for (Mirror& m : w.mirror) {
         if (!m.exists() || uint64_t(m.slot) * kWindow + at < min_off) continue;
-        const uint32_t miss = mismatches(w, m, a0, a1);
-        if (miss == 0) {
-            chosen = &m, chosen_miss = 0;
-            break;
+        uint32_t ch, co;
+        count_mismatch(w, m, a0, a1, ch, co);
+        if (ch == 0) {
+            if (co < best_cold) best_cold = co, chosen = &m, chosen_changed = 0, chosen_cold = co;
+        } else if (mirror_idle(m, rec, done) && ch + co < idle_cost) {
+            idle_cost = ch + co, idle = &m, idle_changed = ch, idle_cold = co;
         }
     }
+    if (!chosen && idle) chosen = idle, chosen_changed = idle_changed, chosen_cold = idle_cold;
     if (!chosen) {
-        // Else the idle mirror that differs least, brought up to date.
-        uint32_t best = UINT32_MAX;
-        for (Mirror& m : w.mirror) {
-            if (!m.exists() || !mirror_idle(m, rec, done) || uint64_t(m.slot) * kWindow + at < min_off) continue;
-            const uint32_t miss = mismatches(w, m, a0, a1);
-            if (miss < best) best = miss, chosen = &m;
-        }
-        chosen_miss = best;
-        if (!chosen) {
-            // Else a new mirror (room made by freeing an idle one of another window when the memory is used up).
-            Mirror* fresh = nullptr;
-            for (Mirror& m : w.mirror)
-                if (!m.exists()) {
-                    fresh = &m;
-                    break;
-                }
-            if (!fresh) {
-                g_pc_stats.in_flight++;  // all three read by submits not done: the ring
-                return false;
+        // 3. Else a new mirror (room made by freeing an idle one of a window not asked for lately).
+        Mirror* fresh = nullptr;
+        for (Mirror& m : w.mirror)
+            if (!m.exists()) {
+                fresh = &m;
+                break;
             }
-            if (!ensure_arena()) {
+        if (!fresh) {
+            g_pc_stats.in_flight++;  // three mirrors, each holding changed pages and read by submits not done: the ring
+            return false;
+        }
+        if (!ensure_arena()) {
+            g_pc_stats.no_memory++;
+            return false;
+        }
+        for (int tries = 0; !take_slot(*fresh, at, min_off); tries++)
+            if (tries == 3 || !make_room(&w, rec, done)) {
+                if (g_arena.free_slots.empty()) g_full_at = g_submits;
                 g_pc_stats.no_memory++;
                 return false;
             }
-            for (int tries = 0; !take_slot(*fresh, at, min_off); tries++)  // room: an idle mirror of another window
-                if (tries == 3 || !make_room(&w, rec, done)) {
-                    g_pc_stats.no_memory++;
-                    return false;
-                }
-            chosen = fresh, chosen_miss = a1 - a0;
-        }
+        chosen = fresh, chosen_changed = 0, chosen_cold = a1 - a0;
     }
 
-    if (chosen_miss) {
+    uint64_t copy_ns = 0;
+    if (chosen_changed + chosen_cold) {
         uint32_t changed = 0;
         const uint64_t c0 = g_pc_stats.copy_ns;
         const uint32_t copied = update_mirror(w, *chosen, base, a0, a1, changed);
-        cost_ns += g_pc_stats.copy_ns - c0;
+        copy_ns = g_pc_stats.copy_ns - c0;
         g_pc_stats.updates++;
         g_pc_stats.copied_bytes += uint64_t(copied) * kPage;
         g_pc_stats.changed_pages += changed;
@@ -408,14 +437,21 @@ bool page_cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_
             g_pc_stats.wrong++;
         }
     }
+    if (verify_on() && chosen_changed + chosen_cold && std::memcmp(chosen->ptr + at, p, size) != 0) {
+        static int said = 0;
+        if (said++ < 20)
+            log("nvn: page cache: an updated mirror differs from the guest bytes (%llu bytes at %p)",
+                (unsigned long long)size, (const void*)p);
+        g_pc_stats.wrong++;
+    }
     // A window whose pages keep changing between asks (CPU-rewritten vertices) goes to the ring for a while.
     w.asked_pages += a1 - a0;
-    if (w.asked_pages >= 2048) {
+    if (w.asked_pages >= 512) {
         if (w.changed_pages * 2 > w.asked_pages) w.streaming_until = g_submits + kStreamingSubmits;
         w.asked_pages = w.changed_pages = 0;
     }
     chosen->last_use = rec;
-    g_judge_ns += cost_ns;
+    g_judge_ns += copy_ns;
     g_judge_bytes += size;
     out = {g_arena.buffer, uint64_t(chosen->slot) * kWindow + at, chosen->ptr + at};
     return true;
@@ -423,18 +459,20 @@ bool page_cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_
 
 void page_cache_log() {
     auto& s = g_pc_stats;
-    if (s.hits + s.updates + s.in_flight + s.streaming + s.no_memory) {
+    if (s.hits + s.updates + s.in_flight + s.streaming + s.no_memory + s.small + s.big) {
         size_t mirrors = 0;
         for (auto& kv : g_windows)
             for (const Mirror& m : kv.second.mirror) mirrors += m.exists();
         log("nvn: page cache: %llu ranges with nothing copied (%.1f MB), %llu ranges updated (%.1f MB of pages copied: "
             "%llu pages changed, %llu new); hashing %llu pages %.1f ms, copying %.1f ms; to the ring: %llu in flight, "
-            "%llu streaming, %llu no memory; %zu windows, %zu mirrors, %.0f of %.0f MB%s%s",
+            "%llu streaming, %llu no memory; to the ring by size: %llu under %llu KB (%.1f MB), %llu over %llu KB (%.1f MB); "
+            "%zu windows, %zu mirrors, %.0f of %.0f MB%s%s",
             (unsigned long long)s.hits, double(s.hit_bytes) / 1e6, (unsigned long long)s.updates,
             double(s.copied_bytes) / 1e6, (unsigned long long)s.changed_pages, (unsigned long long)s.cold_pages,
             (unsigned long long)s.hashed_pages, double(s.hash_ns) / 1e6, double(s.copy_ns) / 1e6,
             (unsigned long long)s.in_flight, (unsigned long long)s.streaming, (unsigned long long)s.no_memory,
-            g_windows.size(), mirrors, double(g_mirror_bytes) / 1e6, double(budget()) / 1e6,
+            (unsigned long long)s.small, (unsigned long long)(kMinRange >> 10), double(s.small_bytes) / 1e6,
+            (unsigned long long)s.big, (unsigned long long)(kGrid >> 10), double(s.big_bytes) / 1e6, g_windows.size(), mirrors, double(g_mirror_bytes) / 1e6, double(budget()) / 1e6,
             g_submits < g_off_until ? "; OFF (cost more than it saved)" : "",
             s.wrong ? "; HITS THAT DIFFER (NX_PAGE_CACHE_VERIFY)" : "");
     }
