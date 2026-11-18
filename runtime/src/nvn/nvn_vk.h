@@ -370,6 +370,7 @@ void gpu_profile_log(uint64_t frames);
 
 namespace replay {
 void dedup_reset();  // nvn_dedup.cpp
+void dedup_submit_breakdown(char* out, size_t n);  // nvn_dedup.cpp: what this submit copied into the ring, per kind
 bool written_separate();         // nvn_written.cpp (nvn_draw_state.h)
 uint64_t written_bind_count();   // nvn_written.cpp: written_bind calls so far (a dispatch bound storage it writes)
 void written_carry(VkCommandBuffer cb);  // nvn_written.cpp: end of a deferred submit, before frame_submit
