@@ -101,7 +101,7 @@ struct {
     uint64_t cold_pages = 0, changed_pages = 0, copied_bytes = 0;
     uint64_t hash_ns = 0, copy_ns = 0, hashed_pages = 0;
     uint64_t in_flight = 0, streaming = 0, no_memory = 0, wrong = 0;
-} g_stats;
+} g_pc_stats;
 
 bool on() {
     static const bool v = [] {
@@ -256,7 +256,7 @@ uint32_t update_mirror(Window& w, Mirror& m, const uint8_t* base, uint32_t a0, u
         copied += j - i;
         i = j;
     }
-    g_stats.copy_ns += plat::monotonic_ns() - t0;
+    g_pc_stats.copy_ns += plat::monotonic_ns() - t0;
     return copied;
 }
 
@@ -322,7 +322,7 @@ bool page_cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_
     Window& w = g_windows[win];
     w.touched = g_submits;
     if (w.streaming_until > g_submits) {
-        g_stats.streaming++;
+        g_pc_stats.streaming++;
         return false;
     }
     const uint8_t* base = reinterpret_cast<const uint8_t*>(uintptr_t(win * kGrid));
@@ -337,10 +337,10 @@ bool page_cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_
         if (w.guest_gen[i] == g_gen) continue;
         w.guest_hash[i] = page_hash(base + uint64_t(i) * kPage);
         w.guest_gen[i] = g_gen;
-        g_stats.hashed_pages++;
+        g_pc_stats.hashed_pages++;
     }
     const uint64_t hash_ns = plat::monotonic_ns() - t0;
-    g_stats.hash_ns += hash_ns;
+    g_pc_stats.hash_ns += hash_ns;
     uint64_t cost_ns = hash_ns;
 
     // A mirror that already holds every page: bound as it is.
@@ -372,16 +372,16 @@ bool page_cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_
                     break;
                 }
             if (!fresh) {
-                g_stats.in_flight++;  // all three read by submits not done: the ring
+                g_pc_stats.in_flight++;  // all three read by submits not done: the ring
                 return false;
             }
             if (!ensure_arena()) {
-                g_stats.no_memory++;
+                g_pc_stats.no_memory++;
                 return false;
             }
             for (int tries = 0; !take_slot(*fresh, at, min_off); tries++)  // room: an idle mirror of another window
                 if (tries == 3 || !make_room(&w, rec, done)) {
-                    g_stats.no_memory++;
+                    g_pc_stats.no_memory++;
                     return false;
                 }
             chosen = fresh, chosen_miss = a1 - a0;
@@ -390,22 +390,22 @@ bool page_cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_
 
     if (chosen_miss) {
         uint32_t changed = 0;
-        const uint64_t c0 = g_stats.copy_ns;
+        const uint64_t c0 = g_pc_stats.copy_ns;
         const uint32_t copied = update_mirror(w, *chosen, base, a0, a1, changed);
-        cost_ns += g_stats.copy_ns - c0;
-        g_stats.updates++;
-        g_stats.copied_bytes += uint64_t(copied) * kPage;
-        g_stats.changed_pages += changed;
-        g_stats.cold_pages += copied - changed;
+        cost_ns += g_pc_stats.copy_ns - c0;
+        g_pc_stats.updates++;
+        g_pc_stats.copied_bytes += uint64_t(copied) * kPage;
+        g_pc_stats.changed_pages += changed;
+        g_pc_stats.cold_pages += copied - changed;
         w.changed_pages += changed;
     } else {
-        g_stats.hits++, g_stats.hit_bytes += size;
+        g_pc_stats.hits++, g_pc_stats.hit_bytes += size;
         if (verify_on() && std::memcmp(chosen->ptr + at, p, size) != 0) {
             static int said = 0;
             if (said++ < 20)
                 log("nvn: page cache: a hit differs from the guest bytes (%llu bytes at %p)", (unsigned long long)size,
                     (const void*)p);
-            g_stats.wrong++;
+            g_pc_stats.wrong++;
         }
     }
     // A window whose pages keep changing between asks (CPU-rewritten vertices) goes to the ring for a while.
@@ -422,7 +422,7 @@ bool page_cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_
 }
 
 void page_cache_log() {
-    auto& s = g_stats;
+    auto& s = g_pc_stats;
     if (s.hits + s.updates + s.in_flight + s.streaming + s.no_memory) {
         size_t mirrors = 0;
         for (auto& kv : g_windows)
