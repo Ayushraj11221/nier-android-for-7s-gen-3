@@ -111,6 +111,7 @@ void count_copy(const uint8_t* p, uint64_t size) {
 }  // namespace
 
 UploadKind g_upload_kind = kUploadOther;
+uint64_t g_upload_min_offset = 0;
 
 Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align) {
     if (!p || !size) {
@@ -133,6 +134,12 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
         return e->upload;
     }
     Upload u;
+    if ((g_upload_kind == kUploadVertex || g_upload_kind == kUploadIndex) &&
+        page_cache_upload(p, size, padded, align, u)) {  // nvn_page_cache.cpp: a mirror, nothing copied into the ring
+        g_copies[p] = {size, padded, u};
+        f = {p, g_generation, {size, padded, u}};
+        return u;
+    }
     if (g_upload_kind != kUploadOther && cache_upload(p, size, padded, align, u)) {  // nvn_buffer_cache.cpp
         g_copies[p] = {size, padded, u};
         f = {p, g_generation, {size, padded, u}};
@@ -169,6 +176,7 @@ void dedup_submit_breakdown(char* out, size_t n) {
 }
 
 void dedup_invalidate(const uint8_t* p, uint64_t size) {
+    page_cache_invalidate(p, size);  // the page hashes of this submit
     // Entries starting before p may still reach into it: look back over the few that can.
     auto it = g_copies.lower_bound(p + size);
     while (it != g_copies.begin()) {

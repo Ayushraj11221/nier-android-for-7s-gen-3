@@ -110,6 +110,14 @@ extern UploadKind g_upload_kind;  // also: only guest buffers (not kUploadOther)
 bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out);
 void cache_begin_submit();  // frees the copies retired submits read
 void cache_log();
+// nvn_page_cache.cpp (NX_PAGE_CACHE=1): vertex and index bytes mirrored page by page across submits, so a draw binds a
+// mirror (a slot of one arena buffer) instead of copying into the ring. g_upload_min_offset: the caller binds the copy at
+// (offset - min), so the copy must lie at an offset of at least that (draw_inputs keeps a vertex copy's place in the stream).
+extern uint64_t g_upload_min_offset;
+bool page_cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out);
+void page_cache_begin_submit();
+void page_cache_invalidate(const uint8_t* p, uint64_t size);
+void page_cache_log();
 void dedup_reset();                                     // at each submit
 void index_range_reset();                               // nvn_written.cpp: the index ranges scanned this submit are dropped
 void dedup_invalidate(const uint8_t* p, uint64_t size);  // guest bytes written during the replay

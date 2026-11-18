@@ -1134,6 +1134,7 @@ void draw_begin_submit() {
     g_submit_ns = plat::monotonic_ns();
     dedup_reset();
     cache_begin_submit();
+    page_cache_begin_submit();
     written_reset();
     pipeline_begin_submit();
 }
@@ -1144,6 +1145,7 @@ void draw_log_stats() {
     if (g_vertex_barriers) log("nvn passes: %llu vertex-read barriers (G4)", (unsigned long long)g_vertex_barriers);
     dedup_log();
     cache_log();
+    page_cache_log();
     render_pass_log();
     written_log();
     sampled_ready_log();

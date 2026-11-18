@@ -607,7 +607,9 @@ bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const C
                     vs->hash.c_str());
         }
         if (ranged && from < end && end <= size && (from > 0 || end + 4096 < size) && !written_overlaps(p, size)) {
+            g_upload_min_offset = from;  // the page cache places the copy at an offset of at least `from`
             Upload u = dedup_upload(p + from, end - from, (end - from + 15) & ~15ull, 16);
+            g_upload_min_offset = 0;
             if (u.offset >= from) {
                 u.offset -= from, u.ptr -= from;
             } else {  // too near the ring's start to bind at offset - from: a copy of [0, end) with only the fetched part
