@@ -179,6 +179,22 @@ bool sync_loose() {
     return on;
 }
 
+bool sync_wait_skip() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_SYNC_WAIT_SKIP");
+        if (e && e[0] == '1') {
+            log("nvn: SyncWait skip enabled (NX_SYNC_WAIT_SKIP=1)");
+            return true;
+        }
+        if (sync_loose()) {
+            log("nvn: SyncWait skip enabled via NX_SYNC_LOOSE");
+            return true;
+        }
+        return false;
+    }();
+    return on;
+}
+
 void submit_done() {
     {
         std::lock_guard lk(g_sub_lock);
@@ -257,6 +273,10 @@ void signal_sync(uint64_t guest) {
 // NVNsyncWaitResult (const NVNsync*, u64 timeout). Always 0 (already signaled), as before: a fenced submit is waited
 // for whatever the timeout, 2 s at most (then the GPU hung and the process ends). Correct results before latency.
 void SyncWait(CPU& c) {
+    if (sync_wait_skip()) {
+        c.x[0] = 0;
+        return;
+    }
     auto* s = get<Sync>(c.x[0]);
     tl("syncwait>");
     if (s) wait_submits(s->seq.load(), kWaitSync);
