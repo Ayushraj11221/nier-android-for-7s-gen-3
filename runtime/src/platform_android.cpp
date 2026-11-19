@@ -756,6 +756,12 @@ extern "C" void android_main(android_app* app) {
                 setenv(key.c_str(), value.c_str(), key == "NX_STRETCH" ? 1 : 0);
             }
         }
+        // NX_TU_DEBUG_GMEM=1 is an app-scoped Turnip experiment. The driver reads TU_DEBUG
+        // while initializing, so set it before any Vulkan entry point is called.
+        if (const char* e = getenv("NX_TU_DEBUG_GMEM"); e && e[0] == '1') {
+            setenv("TU_DEBUG", "gmem", 1);
+            nx::log("gpu driver: TU_DEBUG=gmem (forced GMEM rendering)");
+        }
         // NX_HANDHELD=0 in config.txt (the launcher's TV mode): docked, 1080p. svc_am.cpp tests only whether the variable
         // exists, so "0" must remove it.
         if (const char* h = getenv("NX_HANDHELD"); h && h[0] == '0')

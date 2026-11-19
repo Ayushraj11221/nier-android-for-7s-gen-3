@@ -576,7 +576,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     // Sampling keeps the clock reads out of almost all draws; this is diagnostic, not a benchmark mode.
     static const bool replay_profile = [] { const char* e = std::getenv("NX_REPLAY_PROFILE"); return e && e[0] == '1'; }();
     static uint64_t profile_draws = 0, profile_total_ns = 0, profile_textures_ns = 0, profile_sets_ns = 0,
-                    profile_inputs_ns = 0, profile_pipeline_ns = 0, profile_bind_ns = 0, profile_from_frame = 0;
+                    profile_inputs_ns = 0, profile_vertex_range_ns = 0, profile_vertex_upload_ns = 0,
+                    profile_index_upload_ns = 0, profile_pipeline_ns = 0, profile_bind_ns = 0, profile_from_frame = 0;
     static uint64_t profile_samples = 0;
     const bool profile_this = replay_profile && ((g_stats.total & 127) == 0);
     const uint64_t profile_start = profile_this ? plat::monotonic_ns() : 0;
@@ -734,11 +735,16 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     // (nvn_written.cpp), which cannot be recorded inside a pass.
     DrawInputs in;
     profile_mark = profile_this ? plat::monotonic_ns() : 0;
-    if (!draw_inputs_shared(cb, vs, indexed, c, in)) {
+    if (!draw_inputs_shared(cb, vs, indexed, c, in, profile_this)) {
         g_stats.no_indices++;
         return false;
     }
-    if (profile_this) profile_inputs_ns += plat::monotonic_ns() - profile_mark;
+    if (profile_this) {
+        profile_inputs_ns += plat::monotonic_ns() - profile_mark;
+        profile_vertex_range_ns += in.vertex_range_ns;
+        profile_vertex_upload_ns += in.vertex_upload_ns;
+        profile_index_upload_ns += in.index_upload_ns;
+    }
     check_vertex_ranges(vs, fs, indexed, c, in);  // NX_CHECK_VERTS (nvn_written.cpp)
     if (!g_rendering) {
         if (gpu_profile_on()) {
@@ -973,10 +979,14 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         if (!profile_from_frame) profile_from_frame = frame;
         if (frame >= profile_from_frame + 300) {
             const double n = profile_samples ? double(profile_samples) : 1.0;
-            log("nvn replay profile (sampled 1/128, %llu draws/300 frames): avg us draw %.1f textures %.1f sets %.1f inputs %.1f pipeline %.1f bind_sets %.1f",
+            log("nvn replay profile (sampled 1/128, %llu draws/300 frames): avg us draw %.1f textures %.1f sets %.1f inputs %.1f vertex_range %.1f vertex_upload %.1f index_upload %.1f pipeline %.1f bind_sets %.1f",
                 (unsigned long long)profile_draws, profile_total_ns / n / 1000.0, profile_textures_ns / n / 1000.0, profile_sets_ns / n / 1000.0,
-                profile_inputs_ns / n / 1000.0, profile_pipeline_ns / n / 1000.0, profile_bind_ns / n / 1000.0);
-            profile_draws = profile_total_ns = profile_textures_ns = profile_sets_ns = profile_inputs_ns = profile_pipeline_ns = profile_bind_ns = profile_samples = 0;
+                profile_inputs_ns / n / 1000.0, profile_vertex_range_ns / n / 1000.0,
+                profile_vertex_upload_ns / n / 1000.0, profile_index_upload_ns / n / 1000.0,
+                profile_pipeline_ns / n / 1000.0, profile_bind_ns / n / 1000.0);
+            profile_draws = profile_total_ns = profile_textures_ns = profile_sets_ns = profile_inputs_ns =
+                profile_vertex_range_ns = profile_vertex_upload_ns = profile_index_upload_ns = profile_pipeline_ns =
+                    profile_bind_ns = profile_samples = 0;
             profile_from_frame = frame;
         }
     }

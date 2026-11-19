@@ -145,8 +145,9 @@ struct DrawInputs {
     Upload vertex[15], index;
     uint32_t used = 0;  // bit s: stream s
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+    uint64_t vertex_range_ns = 0, vertex_upload_ns = 0, index_upload_ns = 0;
 };
-bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in);
+bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in, bool profile = false);
 // NX_CHECK_VERTS=1: logs draws that fetch vertices or instances past their bound vertex buffer range (debugging).
 void check_vertex_ranges(const ShaderInfo* vs, const ShaderInfo* fs, bool indexed, const Cmd& c, const DrawInputs& in);
 
@@ -176,7 +177,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
 void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayout& layout);
 Upload zero_stream();  // 64 zero bytes for vertex binding 15
 // draw_inputs, with 16- and 32-bit indices through dedup_upload.
-bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in);
+bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in, bool profile = false);
 std::vector<WriteBack>& separate_write_backs();  // NX_COMPUTE_SEPARATE=1: a write-back per binding
 void sets_begin_submit();
 void sets_log();

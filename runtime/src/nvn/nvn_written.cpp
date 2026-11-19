@@ -552,7 +552,8 @@ static bool fetched_range(bool indexed, const Cmd& c, uint64_t& lo, uint64_t& hi
     return true;
 }
 
-bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in) {
+bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in, bool profile) {
+    uint64_t mark = profile ? plat::monotonic_ns() : 0;
     // Vertex buffers: the bound ranges of the streams the vertex shader reads (the pipeline declares no others).
     // Only the bytes of the vertices the draw fetches (NieR binds whole vertex pools of several MB per draw: ~80 MB
     // a frame were copied, 1% of it the same as the last copy). The copy keeps its place in the stream, so the
@@ -587,6 +588,8 @@ bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const C
                                                                         size));
         }
     }
+    if (profile) in.vertex_range_ns += plat::monotonic_ns() - mark;
+    mark = profile ? plat::monotonic_ns() : 0;
     for (uint32_t s = 0; s < 15; s++) {
         if (!(in.used >> s & 1)) continue;
         const Range& r = g_state.vertex_buffers[s];
@@ -628,7 +631,9 @@ bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const C
         }
         g_upload_kind = kUploadOther;
     }
+    if (profile) in.vertex_upload_ns += plat::monotonic_ns() - mark;
     if (!indexed) return true;
+    mark = profile ? plat::monotonic_ns() : 0;
     uint32_t count = uint32_t(c.i[0]);
     const uint8_t* p = guest_bytes(c.a[0]);
     if (!p) return false;
@@ -657,6 +662,7 @@ bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const C
             in.index = upload(p, bytes, 16);
         }
     }
+    if (profile) in.index_upload_ns += plat::monotonic_ns() - mark;
     return true;
 }
 

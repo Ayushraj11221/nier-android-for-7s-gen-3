@@ -10,6 +10,7 @@
 
 #include "nvn_draw_state.h"
 #include "nvn_ultrawide.h"
+#include "platform.h"
 
 namespace nx::nvn::replay {
 
@@ -322,6 +323,7 @@ constexpr uint32_t kSetSlots = 32768;
 CachedSet g_set_cache[kSetSlots];
 std::vector<SetWrite> g_set_arena;
 uint64_t g_set_generation = 1, g_set_hits = 0, g_set_misses = 0;
+uint64_t g_set_probes = 0, g_set_probe_max = 0;
 uint32_t g_set_used = 0;
 
 bool set_cache_on() {
@@ -367,7 +369,9 @@ void resolve_sets(const ProgramLayout& layout) {
         d.sets[k] = VK_NULL_HANDLE;
         if (key.empty()) continue;
         CachedSet* slot = nullptr;
+        uint64_t probes = 0;
         for (uint32_t probe = uint32_t(h >> 32);; probe++) {
+            probes++;
             CachedSet& c = g_set_cache[probe & (kSetSlots - 1)];
             if (c.generation != g_set_generation) {
                 slot = &c;
@@ -379,6 +383,8 @@ void resolve_sets(const ProgramLayout& layout) {
                 break;
             }
         }
+        g_set_probes += probes;
+        g_set_probe_max = std::max(g_set_probe_max, probes);
         if (d.sets[k]) continue;
         d.sets[k] = descriptor_set(layout.sets[k]), g_set_misses++;
         for (size_t i = 0; i < d.writes.size(); i++)
@@ -722,10 +728,11 @@ Upload zero_stream() {
 // draw_inputs (nvn_written.cpp) with the indices shared: a mesh drawn in several passes of a submit (depth, shadows,
 // colour) had its index buffer copied each time. Guest bytes, like the vertex streams, so dedup's rule holds; 8-bit
 // indices are widened per draw as before.
-bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in) {
+bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in, bool profile) {
     if (!indexed || draw_slow(kSlowUploads) || vk_index_type(c.mask) == VK_INDEX_TYPE_UINT8_EXT)
-        return draw_inputs(cb, vs, indexed, c, in);
-    draw_inputs(cb, vs, false, c, in);  // the vertex streams
+        return draw_inputs(cb, vs, indexed, c, in, profile);
+    draw_inputs(cb, vs, false, c, in, profile);  // the vertex streams
+    uint64_t mark = profile ? plat::monotonic_ns() : 0;
     const uint8_t* p = guest_bytes(c.a[0]);
     if (!p) return false;
     in.index_type = vk_index_type(c.mask);
@@ -733,6 +740,7 @@ bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, 
     g_upload_kind = kUploadIndex;
     if (!written_read(cb, p, bytes, bytes, index_size(c.mask), in.index)) in.index = dedup_upload(p, bytes, bytes, 16);
     g_upload_kind = kUploadOther;
+    if (profile) in.index_upload_ns += plat::monotonic_ns() - mark;
     return true;
 }
 
@@ -747,9 +755,10 @@ void sets_log() {
         log("nvn: texture handles: %llu from the submit's cache, %llu looked up; %llu empty descriptor sets skipped",
             (unsigned long long)g_handle_hits, (unsigned long long)g_handle_misses, (unsigned long long)g_sets_skipped);
     if (g_set_hits + g_set_misses)
-        log("nvn: descriptor sets: %llu reused from the submit's cache, %llu made", (unsigned long long)g_set_hits,
-            (unsigned long long)g_set_misses);
-    g_handle_hits = g_handle_misses = g_sets_skipped = g_set_hits = g_set_misses = 0;
+        log("nvn: descriptor sets: %llu reused from the submit's cache, %llu made; lookup probes %llu (max %llu)",
+            (unsigned long long)g_set_hits, (unsigned long long)g_set_misses, (unsigned long long)g_set_probes,
+            (unsigned long long)g_set_probe_max);
+    g_handle_hits = g_handle_misses = g_sets_skipped = g_set_hits = g_set_misses = g_set_probes = g_set_probe_max = 0;
 }
 
 }  // namespace nx::nvn::replay
