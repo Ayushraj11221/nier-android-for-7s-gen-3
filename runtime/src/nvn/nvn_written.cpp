@@ -554,9 +554,6 @@ static bool fetched_range(bool indexed, const Cmd& c, uint64_t& lo, uint64_t& hi
 
 bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in) {
     // Vertex buffers: the bound ranges of the streams the vertex shader reads (the pipeline declares no others).
-    for (const ShaderIo& io : vs->refl.inputs)
-        if (io.location < g_state.attribs.size() && g_state.attribs[io.location].stream < 15)
-            in.used |= 1u << g_state.attribs[io.location].stream;
     // Only the bytes of the vertices the draw fetches (NieR binds whole vertex pools of several MB per draw: ~80 MB
     // a frame were copied, 1% of it the same as the last copy). The copy keeps its place in the stream, so the
     // binding (offset - lo) and the vertex numbers do not change. Its effect buffer is bound from the same base with
@@ -566,6 +563,30 @@ bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const C
     uint64_t lo = 0, hi = 0, inst_lo = 0, inst_hi = 0;
     // From the command, not `indexed`: draw_inputs_shared asks for the vertex streams of an indexed draw with false.
     const bool ranged = trim && !g_draw_untrimmed && fetched_range(c.op == Cmd::DrawElements, c, lo, hi, inst_lo, inst_hi);
+    uint64_t stream_from[15];
+    uint64_t stream_end[15] = {};
+    std::fill(std::begin(stream_from), std::end(stream_from), UINT64_MAX);
+    static const bool whole = !(std::getenv("NX_VERTEX_WHOLE") && std::getenv("NX_VERTEX_WHOLE")[0] == '0');
+    // Collect the used streams and their fetch bounds together instead of rescanning all shader inputs per stream.
+    for (const ShaderIo& io : vs->refl.inputs) {
+        if (io.location >= g_state.attribs.size()) continue;
+        const VertexAttrib& va = g_state.attribs[io.location];
+        const uint32_t s = va.stream;
+        if (s >= 15) continue;
+        in.used |= 1u << s;
+        if (!ranged || s >= g_state.streams.size()) continue;
+        const VertexStream& st = g_state.streams[s];
+        const uint64_t first = st.divisor ? inst_lo / st.divisor : lo;
+        const uint64_t last = st.divisor ? inst_hi / st.divisor : hi;
+        stream_from[s] = std::min(stream_from[s], first * st.stride + va.offset);
+        stream_end[s] = std::max(stream_end[s], last * st.stride + va.offset + vk_block_bytes(vk_vertex_format(va.format)));
+        if (whole && st.stride) {
+            stream_from[s] = std::min(stream_from[s], first * st.stride);
+            const uint64_t size = std::min<uint64_t>(g_state.vertex_buffers[s].size, 64ull << 20);
+            stream_end[s] = std::max(stream_end[s], std::min<uint64_t>(last * st.stride + st.stride,
+                                                                        size));
+        }
+    }
     for (uint32_t s = 0; s < 15; s++) {
         if (!(in.used >> s & 1)) continue;
         const Range& r = g_state.vertex_buffers[s];
@@ -574,24 +595,8 @@ bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const C
         g_upload_kind = kUploadVertex;
         uint64_t from = 0, end = 0;
         if (ranged && size > 4096 && s < g_state.streams.size()) {
-            const VertexStream& st = g_state.streams[s];
-            from = UINT64_MAX;
-            for (const ShaderIo& io : vs->refl.inputs) {
-                if (io.location >= g_state.attribs.size() || g_state.attribs[io.location].stream != s) continue;
-                const VertexAttrib& va = g_state.attribs[io.location];
-                uint64_t first = st.divisor ? inst_lo / st.divisor : lo, last = st.divisor ? inst_hi / st.divisor : hi;
-                from = std::min(from, first * st.stride + va.offset);
-                end = std::max(end, last * st.stride + va.offset + vk_block_bytes(vk_vertex_format(va.format)));
-                // The range covers whole vertices, whatever attributes this pass reads: the z-prepass, the shadow pass
-                // and the colour pass draw the same mesh range reading different attributes, and ranges that differed
-                // by a few bytes missed dedup_upload (it needs an equal address and size) and were copied again.
-                // NX_VERTEX_WHOLE=0: the exact attribute range as before.
-                static const bool whole = !(std::getenv("NX_VERTEX_WHOLE") && std::getenv("NX_VERTEX_WHOLE")[0] == '0');
-                if (whole && st.stride) {
-                    from = std::min(from, first * st.stride);
-                    end = std::max(end, std::min<uint64_t>(last * st.stride + st.stride, size));
-                }
-            }
+            from = stream_from[s];
+            end = stream_end[s];
             from &= ~uint64_t(255);  // the attributes keep their alignment
         }
         static const uint64_t big = std::getenv("NX_LOG_BIG_VERTEX") ? std::strtoull(std::getenv("NX_LOG_BIG_VERTEX"), nullptr, 10) : 0;

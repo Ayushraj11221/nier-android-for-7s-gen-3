@@ -301,7 +301,7 @@ struct Descriptors {
     std::vector<uint8_t> set_index;  // the set of each write (its dstSet is filled when the set is known)
     std::vector<VkDescriptorBufferInfo> buffers;
     std::vector<VkDescriptorImageInfo> images;
-    std::vector<SetWrite> key;  // scratch for the set cache
+    std::vector<SetWrite> key[4];  // scratch keys grouped by set for the set cache
     uint64_t dynamic = 0;              // set 0 bindings given a dynamic offset (ProgramLayout::dynamic)
     uint32_t dynamic_offset[64] = {};  // their ring offsets, by binding
 };
@@ -342,25 +342,30 @@ uint64_t handle_bits(H h) {
 // d.sets from the cache or newly made, the writes of the cached ones dropped and the rest pointed at their new sets.
 void resolve_sets(const ProgramLayout& layout) {
     Descriptors& d = g_sets;
+    for (auto& key : d.key) key.clear();
+    uint64_t hashes[4];
+    for (uint32_t k = 0; k < 4; k++) hashes[k] = handle_bits(layout.sets[k]) * 0x9E3779B97F4A7C15ull;
+    // Group keys once. The old path rescanned every write for each of the four sets.
+    for (size_t i = 0; i < d.writes.size(); i++) {
+        const uint32_t k = d.set_index[i];
+        if (k >= 4) continue;
+        const VkWriteDescriptorSet& w = d.writes[i];
+        SetWrite e;
+        e.binding = w.dstBinding, e.type = uint32_t(w.descriptorType);
+        if (w.pBufferInfo)
+            e.a = handle_bits(w.pBufferInfo->buffer), e.b = w.pBufferInfo->offset, e.c = w.pBufferInfo->range;
+        else if (w.pImageInfo)
+            e.a = handle_bits(w.pImageInfo->imageView), e.b = handle_bits(w.pImageInfo->sampler),
+            e.c = uint64_t(w.pImageInfo->imageLayout);
+        for (uint64_t v : {uint64_t(e.binding) << 32 | e.type, e.a, e.b, e.c})
+            hashes[k] = (hashes[k] ^ v) * 0x100000001B3ull, hashes[k] ^= hashes[k] >> 31;
+        d.key[k].push_back(e);
+    }
     for (uint32_t k = 0; k < 4; k++) {
-        d.key.clear();
-        uint64_t h = handle_bits(layout.sets[k]) * 0x9E3779B97F4A7C15ull;
-        for (size_t i = 0; i < d.writes.size(); i++) {
-            if (d.set_index[i] != k) continue;
-            const VkWriteDescriptorSet& w = d.writes[i];
-            SetWrite e;
-            e.binding = w.dstBinding, e.type = uint32_t(w.descriptorType);
-            if (w.pBufferInfo)
-                e.a = handle_bits(w.pBufferInfo->buffer), e.b = w.pBufferInfo->offset, e.c = w.pBufferInfo->range;
-            else if (w.pImageInfo)
-                e.a = handle_bits(w.pImageInfo->imageView), e.b = handle_bits(w.pImageInfo->sampler),
-                e.c = uint64_t(w.pImageInfo->imageLayout);
-            for (uint64_t v : {uint64_t(e.binding) << 32 | e.type, e.a, e.b, e.c})
-                h = (h ^ v) * 0x100000001B3ull, h ^= h >> 31;
-            d.key.push_back(e);
-        }
+        auto& key = d.key[k];
+        const uint64_t h = hashes[k];
         d.sets[k] = VK_NULL_HANDLE;
-        if (d.key.empty()) continue;
+        if (key.empty()) continue;
         CachedSet* slot = nullptr;
         for (uint32_t probe = uint32_t(h >> 32);; probe++) {
             CachedSet& c = g_set_cache[probe & (kSetSlots - 1)];
@@ -368,8 +373,8 @@ void resolve_sets(const ProgramLayout& layout) {
                 slot = &c;
                 break;
             }
-            if (c.hash == h && c.layout == layout.sets[k] && c.n == d.key.size() &&
-                std::memcmp(&g_set_arena[c.at], d.key.data(), d.key.size() * sizeof(SetWrite)) == 0) {
+            if (c.hash == h && c.layout == layout.sets[k] && c.n == key.size() &&
+                std::memcmp(&g_set_arena[c.at], key.data(), key.size() * sizeof(SetWrite)) == 0) {
                 d.sets[k] = c.set, g_set_hits++;
                 break;
             }
@@ -379,8 +384,8 @@ void resolve_sets(const ProgramLayout& layout) {
         for (size_t i = 0; i < d.writes.size(); i++)
             if (d.set_index[i] == k) d.writes[i].dstSet = d.sets[k];
         if (!d.sets[k] || g_set_used >= kSetSlots / 2) continue;
-        *slot = {g_set_generation, h, layout.sets[k], uint32_t(g_set_arena.size()), uint32_t(d.key.size()), d.sets[k]};
-        g_set_arena.insert(g_set_arena.end(), d.key.begin(), d.key.end());
+        *slot = {g_set_generation, h, layout.sets[k], uint32_t(g_set_arena.size()), uint32_t(key.size()), d.sets[k]};
+        g_set_arena.insert(g_set_arena.end(), key.begin(), key.end());
         g_set_used++;
     }
     size_t kept = 0;  // the writes of new sets only

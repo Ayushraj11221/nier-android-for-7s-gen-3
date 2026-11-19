@@ -575,8 +575,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     // NX_REPLAY_PROFILE=1 samples one draw in 128 and reports its CPU-side replay costs every 300 frames.
     // Sampling keeps the clock reads out of almost all draws; this is diagnostic, not a benchmark mode.
     static const bool replay_profile = [] { const char* e = std::getenv("NX_REPLAY_PROFILE"); return e && e[0] == '1'; }();
-    static uint64_t profile_draws = 0, profile_total_ns = 0, profile_sets_ns = 0, profile_inputs_ns = 0,
-                    profile_pipeline_ns = 0, profile_bind_ns = 0, profile_from_frame = 0;
+    static uint64_t profile_draws = 0, profile_total_ns = 0, profile_textures_ns = 0, profile_sets_ns = 0,
+                    profile_inputs_ns = 0, profile_pipeline_ns = 0, profile_bind_ns = 0, profile_from_frame = 0;
     static uint64_t profile_samples = 0;
     const bool profile_this = replay_profile && ((g_stats.total & 127) == 0);
     const uint64_t profile_start = profile_this ? plat::monotonic_ns() : 0;
@@ -655,7 +655,9 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             }
     }
     // Textures first: an upload or a layout change cannot happen inside the render pass.
+    uint64_t profile_mark = profile_this ? plat::monotonic_ns() : 0;
     uint32_t gathered = gather_textures(*shaders);
+    if (profile_this) profile_textures_ns += plat::monotonic_ns() - profile_mark;
     {   // NX_DUMP_DRAW_TEXTURES=<fs hash>@<draw>: the images the first such draw samples, snapshotted (frames/00000_c00000NN)
         static const char* env = std::getenv("NX_DUMP_DRAW_TEXTURES");
         static int done_count = 0;
@@ -725,7 +727,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             draw_end_rendering(cb, 1);
     }
 
-    uint64_t profile_mark = profile_this ? plat::monotonic_ns() : 0;
+    profile_mark = profile_this ? plat::monotonic_ns() : 0;
     build_sets(cb, *shaders, layout);
     if (profile_this) profile_sets_ns += plat::monotonic_ns() - profile_mark;
     // Vertex and index data before the pass begins: a range a dispatch of this submit wrote may need a GPU copy
@@ -971,10 +973,10 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         if (!profile_from_frame) profile_from_frame = frame;
         if (frame >= profile_from_frame + 300) {
             const double n = profile_samples ? double(profile_samples) : 1.0;
-            log("nvn replay profile (sampled 1/128, %llu draws/300 frames): avg us draw %.1f sets %.1f inputs %.1f pipeline %.1f bind_sets %.1f",
-                (unsigned long long)profile_draws, profile_total_ns / n / 1000.0, profile_sets_ns / n / 1000.0,
+            log("nvn replay profile (sampled 1/128, %llu draws/300 frames): avg us draw %.1f textures %.1f sets %.1f inputs %.1f pipeline %.1f bind_sets %.1f",
+                (unsigned long long)profile_draws, profile_total_ns / n / 1000.0, profile_textures_ns / n / 1000.0, profile_sets_ns / n / 1000.0,
                 profile_inputs_ns / n / 1000.0, profile_pipeline_ns / n / 1000.0, profile_bind_ns / n / 1000.0);
-            profile_draws = profile_total_ns = profile_sets_ns = profile_inputs_ns = profile_pipeline_ns = profile_bind_ns = profile_samples = 0;
+            profile_draws = profile_total_ns = profile_textures_ns = profile_sets_ns = profile_inputs_ns = profile_pipeline_ns = profile_bind_ns = profile_samples = 0;
             profile_from_frame = frame;
         }
     }
