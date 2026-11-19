@@ -432,6 +432,13 @@ void* open_custom_vulkan() {
     std::string libdir = info.dli_fname;  // .../lib/arm64/libnier.so: the hook libraries are next to it
     libdir = libdir.substr(0, libdir.rfind('/') + 1);
     nx::log("gpu driver: opening custom driver %s%s (hooks in %s)", dir.c_str(), name.c_str(), libdir.c_str());
+    // Turnip reads TU_DEBUG during driver initialization. Set it immediately before loading
+    // the custom driver so it is present when the driver's initialization code runs.
+    if (const char* e = getenv("NX_TU_DEBUG_GMEM"); e && e[0] == '1') {
+        const bool set = adrenotools_set_freedreno_env("TU_DEBUG", "gmem");
+        nx::log("gpu driver: TU_DEBUG=gmem %s before custom driver initialization",
+                set ? "set" : "could not be set");
+    }
     void* h = adrenotools_open_libvulkan(RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM, nullptr, libdir.c_str(),
                                          dir.c_str(), name.c_str(), nullptr, nullptr);
     nx::log("gpu driver: %s", h ? "custom driver opened" : "failed, the system driver is used");
@@ -755,12 +762,6 @@ extern "C" void android_main(android_app* app) {
                 // Launcher and NativeActivity share a process: update stretch even if a previous launch set it to "1".
                 setenv(key.c_str(), value.c_str(), key == "NX_STRETCH" ? 1 : 0);
             }
-        }
-        // NX_TU_DEBUG_GMEM=1 is an app-scoped Turnip experiment. The driver reads TU_DEBUG
-        // while initializing, so set it before any Vulkan entry point is called.
-        if (const char* e = getenv("NX_TU_DEBUG_GMEM"); e && e[0] == '1') {
-            setenv("TU_DEBUG", "gmem", 1);
-            nx::log("gpu driver: TU_DEBUG=gmem (forced GMEM rendering)");
         }
         // NX_HANDHELD=0 in config.txt (the launcher's TV mode): docked, 1080p. svc_am.cpp tests only whether the variable
         // exists, so "0" must remove it.
