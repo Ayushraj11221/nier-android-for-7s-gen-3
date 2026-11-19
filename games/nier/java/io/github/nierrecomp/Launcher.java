@@ -988,7 +988,7 @@ public class Launcher extends Activity {
 
     // The last lines of the kinds that show where the frame time goes (replay, GPU, the game's waits, threads, memory).
     static String summary(String text) {
-        String[] keys = {"per frame over", "gpu busy", "gpu time feed", "the game's waits", "threads:", "present intervals",
+        String[] keys = {"per frame over", "gpu busy", "gpu time feed", "nvn replay profile", "the game's waits", "threads:", "present intervals",
                 "memory:", "governor", "gpu:", "stall:", "uploads of", "vertex source", "write-backs per frame"};
         java.util.ArrayList<String> hits = new java.util.ArrayList<String>();
         for (String line : text.split("\n")) {

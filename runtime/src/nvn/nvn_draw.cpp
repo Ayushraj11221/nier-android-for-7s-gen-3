@@ -572,6 +572,14 @@ bool live_ui_draw(const Targets& t) {
 }
 
 bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c) {
+    // NX_REPLAY_PROFILE=1 samples one draw in 128 and reports its CPU-side replay costs every 300 frames.
+    // Sampling keeps the clock reads out of almost all draws; this is diagnostic, not a benchmark mode.
+    static const bool replay_profile = [] { const char* e = std::getenv("NX_REPLAY_PROFILE"); return e && e[0] == '1'; }();
+    static uint64_t profile_draws = 0, profile_total_ns = 0, profile_sets_ns = 0, profile_inputs_ns = 0,
+                    profile_pipeline_ns = 0, profile_bind_ns = 0, profile_from_frame = 0;
+    static uint64_t profile_samples = 0;
+    const bool profile_this = replay_profile && ((g_stats.total & 127) == 0);
+    const uint64_t profile_start = profile_this ? plat::monotonic_ns() : 0;
     g_stats.total++;
     if (g_state.rasterizer_discard || !g_state.render_enable) return false;  // nothing reaches the targets
     if (shadow_draw_skipped(t)) return false;
@@ -717,14 +725,18 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             draw_end_rendering(cb, 1);
     }
 
+    uint64_t profile_mark = profile_this ? plat::monotonic_ns() : 0;
     build_sets(cb, *shaders, layout);
+    if (profile_this) profile_sets_ns += plat::monotonic_ns() - profile_mark;
     // Vertex and index data before the pass begins: a range a dispatch of this submit wrote may need a GPU copy
     // (nvn_written.cpp), which cannot be recorded inside a pass.
     DrawInputs in;
+    profile_mark = profile_this ? plat::monotonic_ns() : 0;
     if (!draw_inputs_shared(cb, vs, indexed, c, in)) {
         g_stats.no_indices++;
         return false;
     }
+    if (profile_this) profile_inputs_ns += plat::monotonic_ns() - profile_mark;
     check_vertex_ranges(vs, fs, indexed, c, in);  // NX_CHECK_VERTS (nvn_written.cpp)
     if (!g_rendering) {
         if (gpu_profile_on()) {
@@ -841,7 +853,9 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                 g_state.viewport[0], g_state.viewport[1], g_state.viewport[2], g_state.viewport[3]);
         }
     }
+    profile_mark = profile_this ? plat::monotonic_ns() : 0;
     VkPipeline pipeline = graphics_pipeline(key, layout);
+    if (profile_this) profile_pipeline_ns += plat::monotonic_ns() - profile_mark;
     if (!pipeline) {
         g_stats.no_pipeline++;
         return false;
@@ -856,7 +870,9 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     } else {
         g_state_kept++;
     }
+    profile_mark = profile_this ? plat::monotonic_ns() : 0;
     bind_sets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout);
+    if (profile_this) profile_bind_ns += plat::monotonic_ns() - profile_mark;
 
     // The vertex buffers resolved above, plus the zero stream (binding 15).
     for (uint32_t s = 0; s < 15; s++)
@@ -945,6 +961,23 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         if (q) zero_draws_end(cb);
     }
     g_stats.done++;
+    if (profile_this) {
+        profile_samples++;
+        profile_draws++;
+        profile_total_ns += plat::monotonic_ns() - profile_start;
+    }
+    if (replay_profile) {
+        const uint64_t frame = g_frame.load();
+        if (!profile_from_frame) profile_from_frame = frame;
+        if (frame >= profile_from_frame + 300) {
+            const double n = profile_samples ? double(profile_samples) : 1.0;
+            log("nvn replay profile (sampled 1/128, %llu draws/300 frames): avg us draw %.1f sets %.1f inputs %.1f pipeline %.1f bind_sets %.1f",
+                (unsigned long long)profile_draws, profile_total_ns / n / 1000.0, profile_sets_ns / n / 1000.0,
+                profile_inputs_ns / n / 1000.0, profile_pipeline_ns / n / 1000.0, profile_bind_ns / n / 1000.0);
+            profile_draws = profile_total_ns = profile_sets_ns = profile_inputs_ns = profile_pipeline_ns = profile_bind_ns = profile_samples = 0;
+            profile_from_frame = frame;
+        }
+    }
     if (g_pass_draws++ == 0 && (exp_render_pass() & 4)) pass_end_only(cb, 9);  // NX_EXP_RP split: one more store and load
     if (gpu_profile_on())
         gpu_profile_count(0, uint64_t(uint32_t(indexed ? c.i[0] : c.i[1])) * uint64_t(std::max(1, c.i[3])));

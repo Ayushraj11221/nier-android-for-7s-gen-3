@@ -3,6 +3,7 @@ package io.github.nierrecomp;
 import android.app.AlertDialog;
 import android.app.NativeActivity;
 import android.content.DialogInterface;
+import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
@@ -17,8 +18,7 @@ import java.io.FileReader;
 
 /**
  * The game's activity: the runtime's NativeActivity (libnier.so, android_main) plus a small Menu button over the
- * picture. Tapping it asks "Exit game?"; yes finishes the activity, which ends the process (android_main) and brings
- * back the app's home screen, so the game no longer has to be swiped away from the recent apps.
+ * picture. Tapping it asks "Exit game?"; yes returns to the app's launcher and finishes the native game activity.
  *
  * The button is a window of its own (a panel attached to the game's window): the game's touches come straight from the
  * window's input queue to native code, so a view added to the game's own window would never see a tap. Anything that
@@ -74,20 +74,19 @@ public class GameActivity extends NativeActivity {
             float d = getResources().getDisplayMetrics().density;
             final float density = d;
             final TextView b = new TextView(this);
-            b.setText(Lang.t("MENÚ", "MENU"));
+            b.setText("×");
             b.setTextColor(Color.WHITE);
-            b.setTextSize(11);
+            b.setTextSize(27);
             b.setGravity(Gravity.CENTER);
-            int pad = (int) (8 * d);
-            b.setPadding(pad, pad, pad, pad);
+            int size = (int) (48 * d);
             GradientDrawable bg = new GradientDrawable();
             bg.setColor(Color.argb(120, 0, 0, 0));
-            bg.setCornerRadius(10 * d);
+            bg.setShape(GradientDrawable.OVAL);
             b.setBackground(bg);
             b.setAlpha(0.65f);
             final WindowManager wm = getWindowManager();
             final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                    WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                    size, size,
                     WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                     PixelFormat.TRANSLUCENT);
@@ -167,6 +166,9 @@ public class GameActivity extends NativeActivity {
             b.setPositiveButton(Lang.t("Salir del juego", "Exit game"), new DialogInterface.OnClickListener() {
                 @Override
                 public void onClick(DialogInterface d, int which) {
+                    Intent home = new Intent(GameActivity.this, Launcher.class);
+                    home.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                    startActivity(home);
                     finish();
                 }
             });
