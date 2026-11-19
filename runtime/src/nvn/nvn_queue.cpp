@@ -272,12 +272,20 @@ void signal_sync(uint64_t guest) {
 
 // NVNsyncWaitResult (const NVNsync*, u64 timeout). Always 0 (already signaled), as before: a fenced submit is waited
 // for whatever the timeout, 2 s at most (then the GPU hung and the process ends). Correct results before latency.
+// NX_SYNC_WAIT_SKIP=1: skip the replay-thread and submit-ordering waits (wait_submits, worker_wait) that cause the
+// game thread to stall for the full replay duration each frame. The gpu_wait for deferred write-backs (compute results:
+// skinning, physics) is still applied so guest memory is correct before the game reads it back.
 void SyncWait(CPU& c) {
+    auto* s = get<Sync>(c.x[0]);
     if (sync_wait_skip()) {
+        // Skip the CPU-blocking waits on the replay thread, but still apply any pending
+        // compute write-backs so the game sees correct GPU results (avoids mesh artifacts).
+        tl("syncwait>");
+        if (uint64_t serial = s ? s->serial.load() : 0) gpu_wait(serial);
+        tl("syncwait<");
         c.x[0] = 0;
         return;
     }
-    auto* s = get<Sync>(c.x[0]);
     tl("syncwait>");
     if (s) wait_submits(s->seq.load(), kWaitSync);
     if (s) worker_wait(s->job);
