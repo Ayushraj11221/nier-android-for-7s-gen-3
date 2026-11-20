@@ -64,6 +64,7 @@ struct Stats {
 extern State g_state;
 extern Stats g_stats;
 extern bool g_hud_target;  // NX_HUD_1080: this draw's target is a 1920x1080 image of a 1280x720 texture (nvn_vk.h)
+void pipeline_state_changed();  // invalidate the cached PipelineKey base after a raster-state mutation
 
 const uint8_t* guest_bytes(uint64_t gpu);
 uint32_t handle_texture(uint64_t handle, uint32_t* sampler);

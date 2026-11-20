@@ -107,7 +107,10 @@ bool raster_command(const Cmd& c) {
                 log("nvn: depth bounds test enabled (%g..%g), not applied", c.f[0], c.f[1]);
             return true;
         }
-        case Cmd::SetDepthClamp: s.depth_clamp = c.n != 0; return true;
+        case Cmd::SetDepthClamp:
+            if (s.depth_clamp != (c.n != 0)) pipeline_state_changed();
+            s.depth_clamp = c.n != 0;
+            return true;
         default: return false;
     }
 }

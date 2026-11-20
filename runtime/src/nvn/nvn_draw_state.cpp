@@ -11,6 +11,45 @@ namespace nx::nvn {
 
 using namespace replay;
 
+namespace {
+uint64_t g_pipeline_state_gen = 1;
+
+struct DeferredLookupCache {
+    struct Entry {
+        const DeferredValues* values = nullptr;
+        uint64_t address = 0;
+        DeferredValues::const_iterator it{};
+        bool valid = false;
+    } entries[8];
+};
+thread_local DeferredLookupCache g_deferred_lookup;
+
+DeferredValues::const_iterator deferred_find(const DeferredValues* values, uint64_t address) {
+    auto& cache = g_deferred_lookup.entries[(address >> 4) & 7];
+    if (!cache.valid || cache.values != values || cache.address != address) {
+        cache.values = values;
+        cache.address = address;
+        cache.it = values ? values->find(address) : DeferredValues::const_iterator{};
+        cache.valid = true;
+    }
+    return cache.it;
+}
+
+template <typename T>
+bool assign_pipeline_state(T& dst, const T& src) {
+    if (std::memcmp(&dst, &src, sizeof(T)) == 0) return false;
+    std::memcpy(&dst, &src, sizeof(T));
+    return true;
+}
+}  // namespace
+
+namespace replay {
+uint64_t pipeline_state_generation() { return g_pipeline_state_gen; }
+void pipeline_state_changed() { ++g_pipeline_state_gen; }
+}  // namespace replay
+
+void deferred_lookup_reset() { g_deferred_lookup = {}; }
+
 void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets) {
     State& s = g_state;
     auto blob = [&](size_t size) -> const uint8_t* {
@@ -21,7 +60,12 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
             std::memcpy(s.viewport, c.i, sizeof s.viewport), s.has_viewport = true;
             break;
         case Cmd::SetRasterizerDiscard: s.rasterizer_discard = c.n != 0; break;
-        case Cmd::SetPrimitiveRestart: s.restart = c.n != 0, s.restart_index = uint32_t(c.a[0]); break;
+        case Cmd::SetPrimitiveRestart: {
+            const bool restart = c.n != 0;
+            if (s.restart != restart) pipeline_state_changed();
+            s.restart = restart, s.restart_index = uint32_t(c.a[0]);
+            break;
+        }
         case Cmd::BindImage:
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 16) s.images[c.i[0]][c.i[1]] = c.a[0];
             break;
@@ -52,21 +96,35 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
             break;
         case Cmd::BindDeferred: {
             const DeferredValues* dv = current_deferred();
-            auto it = dv ? dv->find(c.a[0]) : DeferredValues::const_iterator{};
-            uint32_t words = c.mask >= 2 ? 2 : 1;
+            auto it = deferred_find(dv, c.a[0]);
             int st = c.i[0];
-            if (st < 0 || st >= kStages) break;
-            for (uint32_t k = 0; k < c.n; k++) {
-                auto value = [&](uint32_t w) {  // the submit's snapshot, else the memory now
-                    size_t at = size_t(k) * words + w;
-                    return dv && it != dv->end() && at < it->second.size() ? it->second[at]
-                                                                            : ld<uint64_t>(c.a[0] + 8 * at);
-                };
-                int slot = c.i[1] + int(k);
-                if (c.mask == 0 && slot >= 0 && slot < 32) s.textures[st][slot] = value(0);
-                if (c.mask == 1 && slot >= 0 && slot < 16) s.images[st][slot] = value(0);
-                if (c.mask == 2 && slot >= 0 && slot < 18) s.uniforms[st][slot] = {value(0), value(1)};
-                if (c.mask == 3 && slot >= 0 && slot < 16) s.storage[st][slot] = {value(0), value(1)};
+            if (st < 0 || st >= kStages || c.mask > 3) break;
+            const auto* vec = (dv && it != dv->end()) ? &it->second : nullptr;
+            const size_t vec_sz = vec ? vec->size() : 0;
+            const uint32_t words = c.mask >= 2 ? 2 : 1;
+            const int limit = c.mask == 0 ? 32 : c.mask == 1 ? 16 : c.mask == 2 ? 18 : 16;
+            const int begin = std::max(c.i[1], 0);
+            const int end = int(std::min<int64_t>(int64_t(c.i[1]) + c.n, limit));
+            if (begin >= end) break;
+            const uint32_t first = uint32_t(begin - c.i[1]);
+            auto value = [&](uint32_t element, uint32_t word) {
+                const size_t at = size_t(element) * words + word;
+                return at < vec_sz ? (*vec)[at] : ld<uint64_t>(c.a[0] + 8 * at);
+            };
+            if (c.mask == 0) {
+                for (int slot = begin; slot < end; ++slot) s.textures[st][slot] = value(first + uint32_t(slot - begin), 0);
+            } else if (c.mask == 1) {
+                for (int slot = begin; slot < end; ++slot) s.images[st][slot] = value(first + uint32_t(slot - begin), 0);
+            } else if (c.mask == 2) {
+                for (int slot = begin; slot < end; ++slot) {
+                    const uint32_t element = first + uint32_t(slot - begin);
+                    s.uniforms[st][slot] = {value(element, 0), value(element, 1)};
+                }
+            } else {
+                for (int slot = begin; slot < end; ++slot) {
+                    const uint32_t element = first + uint32_t(slot - begin);
+                    s.storage[st][slot] = {value(element, 0), value(element, 1)};
+                }
             }
             break;
         }
@@ -82,33 +140,64 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
         case Cmd::SetTexturePool: s.texture_pool = c.a[0]; break;
         case Cmd::SetSamplerPool: s.sampler_pool = c.a[0]; break;
         case Cmd::BindVertexAttribs:
-            if (auto* p = blob(c.n * sizeof(VertexAttrib)))
-                s.attribs.assign(reinterpret_cast<const VertexAttrib*>(p), reinterpret_cast<const VertexAttrib*>(p) + c.n);
+            if (auto* p = blob(c.n * sizeof(VertexAttrib))) {
+                const size_t n = c.n;
+                if (s.attribs.size() != n || (n && std::memcmp(s.attribs.data(), p, n * sizeof(VertexAttrib)) != 0)) {
+                    s.attribs.assign(reinterpret_cast<const VertexAttrib*>(p), reinterpret_cast<const VertexAttrib*>(p) + n);
+                    pipeline_state_changed();
+                }
+            }
             break;
         case Cmd::BindVertexStreams:
-            if (auto* p = blob(c.n * sizeof(VertexStream)))
-                s.streams.assign(reinterpret_cast<const VertexStream*>(p), reinterpret_cast<const VertexStream*>(p) + c.n);
+            if (auto* p = blob(c.n * sizeof(VertexStream))) {
+                const size_t n = c.n;
+                if (s.streams.size() != n || (n && std::memcmp(s.streams.data(), p, n * sizeof(VertexStream)) != 0)) {
+                    s.streams.assign(reinterpret_cast<const VertexStream*>(p), reinterpret_cast<const VertexStream*>(p) + n);
+                    pipeline_state_changed();
+                }
+            }
             break;
         case Cmd::BindBlendState:
             if (auto* p = blob(sizeof(BlendTarget))) {
                 BlendTarget b;
                 std::memcpy(&b, p, sizeof b);
-                if (b.target < 8) s.blend[b.target] = b;
+                if (b.target < 8 && assign_pipeline_state(s.blend[b.target], b)) pipeline_state_changed();
             }
             break;
         case Cmd::BindColorState:
-            if (auto* p = blob(sizeof(ColorStateInfo))) std::memcpy(&s.color, p, sizeof s.color);
+            if (auto* p = blob(sizeof(ColorStateInfo))) {
+                ColorStateInfo value;
+                std::memcpy(&value, p, sizeof value);
+                if (assign_pipeline_state(s.color, value)) pipeline_state_changed();
+            }
             break;
         case Cmd::BindChannelMaskState:
-            if (auto* p = blob(sizeof(ChannelMaskInfo))) std::memcpy(&s.mask, p, sizeof s.mask);
+            if (auto* p = blob(sizeof(ChannelMaskInfo))) {
+                ChannelMaskInfo value;
+                std::memcpy(&value, p, sizeof value);
+                if (assign_pipeline_state(s.mask, value)) pipeline_state_changed();
+            }
             break;
         case Cmd::BindDepthStencilState:
-            if (auto* p = blob(sizeof(DepthStencilInfo))) std::memcpy(&s.depth, p, sizeof s.depth);
+            if (auto* p = blob(sizeof(DepthStencilInfo))) {
+                DepthStencilInfo value;
+                std::memcpy(&value, p, sizeof value);
+                if (assign_pipeline_state(s.depth, value)) pipeline_state_changed();
+            }
             break;
         case Cmd::BindPolygonState:
-            if (auto* p = blob(sizeof(PolygonInfo))) std::memcpy(&s.polygon, p, sizeof s.polygon);
+            if (auto* p = blob(sizeof(PolygonInfo))) {
+                PolygonInfo value;
+                std::memcpy(&value, p, sizeof value);
+                if (assign_pipeline_state(s.polygon, value)) pipeline_state_changed();
+            }
             break;
-        case Cmd::BindMultisampleState: s.alpha_to_coverage = c.n != 0; break;
+        case Cmd::BindMultisampleState: {
+            const bool alpha_to_coverage = c.n != 0;
+            if (s.alpha_to_coverage != alpha_to_coverage) pipeline_state_changed();
+            s.alpha_to_coverage = alpha_to_coverage;
+            break;
+        }
         case Cmd::SetBlendColor: std::memcpy(s.blend_color, c.f, sizeof s.blend_color); break;
         case Cmd::UpdateUniformBuffer: {  // (buffer address, size, offset, data): written in order, like the GPU
             uint64_t off = c.a[2];
