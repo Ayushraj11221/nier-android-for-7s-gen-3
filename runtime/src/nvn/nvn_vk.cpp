@@ -688,7 +688,6 @@ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_
         free_retired_images(frame_completed());
     }
     if (!begin(true)) return;
-    deferred_lookup_reset();
     draw_begin_submit();
     gpu_profile_begin(g_cb);
     zero_draws_begin_submit(g_cb);

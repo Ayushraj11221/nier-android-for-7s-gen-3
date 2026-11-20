@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -27,14 +28,8 @@ struct Entry {
     uint64_t size = 0, padded = 0;
     Upload upload;
 };
-// By host address; generation stamps make submit reset O(1) and avoid per-upload tree nodes.
-struct CopySlot {
-    const uint8_t* p = nullptr;
-    Entry entry{};
-    uint64_t generation = 0;
-};
-std::vector<CopySlot> g_copies(2048);
-size_t g_copy_count = 0;
+// By host address; several sizes of one address are rare, so the latest one is kept.
+std::map<const uint8_t*, Entry> g_copies;
 uint64_t g_saved = 0, g_copied = 0;
 
 // In front of the map (a tree walk per bound buffer of every draw, and most are hits): a slot per address hash with a
@@ -48,71 +43,6 @@ struct Front {
 Front g_front[1024];
 uint64_t g_generation = 1;
 Front& front_of(const uint8_t* p) { return g_front[(uintptr_t(p) >> 4 ^ uintptr_t(p) >> 14) & 1023]; }
-
-size_t copy_hash(const uint8_t* p) {
-    uintptr_t v = uintptr_t(p) >> 4;
-    v ^= v >> 17;
-    v *= uintptr_t(0xed5ad4bb);
-    v ^= v >> 11;
-    return size_t(v);
-}
-
-CopySlot* copy_find(const uint8_t* p) {
-    const size_t mask = g_copies.size() - 1;
-    size_t at = copy_hash(p) & mask;
-    for (size_t probe = 0; probe < g_copies.size(); ++probe, at = (at + 1) & mask) {
-        CopySlot& slot = g_copies[at];
-        if (slot.generation == g_generation && slot.p == p) return &slot;
-        if (slot.generation == 0 && !slot.p) return nullptr;
-    }
-    return nullptr;
-}
-
-void copy_rehash(size_t capacity) {
-    std::vector<CopySlot> fresh(capacity);
-    const size_t mask = capacity - 1;
-    for (const CopySlot& old : g_copies) {
-        if (old.generation != g_generation) continue;
-        size_t at = copy_hash(old.p) & mask;
-        while (fresh[at].generation == g_generation) at = (at + 1) & mask;
-        fresh[at] = old;
-    }
-    g_copies.swap(fresh);
-}
-
-CopySlot& copy_store(const uint8_t* p, const Entry& entry) {
-    if (CopySlot* slot = copy_find(p)) {
-        slot->entry = entry;
-        return *slot;
-    }
-    if ((g_copy_count + 1) * 10 >= g_copies.size() * 7) copy_rehash(g_copies.size() * 2);
-    const size_t mask = g_copies.size() - 1;
-    size_t at = copy_hash(p) & mask, stale = g_copies.size();
-    for (size_t probe = 0; probe < g_copies.size(); ++probe, at = (at + 1) & mask) {
-        CopySlot& slot = g_copies[at];
-        if (slot.generation == g_generation && slot.p == p) {
-            slot.entry = entry;
-            return slot;
-        }
-        if (slot.generation != g_generation && stale == g_copies.size()) stale = at;
-        if (slot.generation == 0 && !slot.p) {
-            if (stale != g_copies.size()) at = stale;
-            CopySlot& dst = g_copies[at];
-            dst.p = p, dst.entry = entry, dst.generation = g_generation;
-            ++g_copy_count;
-            return dst;
-        }
-    }
-    // The table is kept below 70% current occupancy; this is only reachable after unusual stale-slot churn.
-    if (stale != g_copies.size()) {
-        CopySlot& dst = g_copies[stale];
-        dst.p = p, dst.entry = entry, dst.generation = g_generation;
-        ++g_copy_count;
-        return dst;
-    }
-    copy_rehash(g_copies.size() * 2);
-    return copy_store(p, entry);
-}
 
 // NX_UPLOAD_STATS: bytes copied per kind, and of those the bytes equal to the last copy of the same address and size.
 struct KindStats {
@@ -195,8 +125,8 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
     const Entry* e = nullptr;
     if (!off && f.generation == g_generation && f.p == p) {
         e = &f.entry;  // the map's entry for p
-    } else if (CopySlot* slot = off ? nullptr : copy_find(p)) {
-        f = {p, g_generation, slot->entry};
+    } else if (auto it = off ? g_copies.end() : g_copies.find(p); it != g_copies.end()) {
+        f = {p, g_generation, it->second};
         e = &f.entry;
     }
     if (e && e->size == size && e->padded == padded && e->upload.offset % align == 0) {
@@ -206,12 +136,12 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
     Upload u;
     if ((g_upload_kind == kUploadVertex || g_upload_kind == kUploadIndex) &&
         page_cache_upload(p, size, padded, align, u)) {  // nvn_page_cache.cpp: a mirror, nothing copied into the ring
-        copy_store(p, {size, padded, u});
+        g_copies[p] = {size, padded, u};
         f = {p, g_generation, {size, padded, u}};
         return u;
     }
     if (g_upload_kind != kUploadOther && cache_upload(p, size, padded, align, u)) {  // nvn_buffer_cache.cpp
-        copy_store(p, {size, padded, u});
+        g_copies[p] = {size, padded, u};
         f = {p, g_generation, {size, padded, u}};
         return u;
     }
@@ -219,7 +149,7 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
     std::memcpy(u.ptr, p, size);
     if (padded > size) std::memset(u.ptr + size, 0, padded - size);
     if (upload_stats_on()) count_copy(p, size);
-    copy_store(p, {size, padded, u});
+    g_copies[p] = {size, padded, u};
     f = {p, g_generation, {size, padded, u}};
     g_copied += padded;
     g_submit_kind_bytes[g_upload_kind < kUploadKinds ? g_upload_kind : kUploadOther] += padded;
@@ -227,13 +157,7 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
 }
 
 void dedup_reset() {
-    ++g_generation;
-    if (!g_generation) {
-        for (CopySlot& slot : g_copies) slot.generation = 0;
-        g_generation = 1;
-    }
-    g_copy_count = 0;
-    index_range_reset();
+    g_copies.clear(), g_generation++, index_range_reset();
     for (uint64_t& b : g_submit_kind_bytes) b = 0;
 }
 
@@ -253,16 +177,16 @@ void dedup_submit_breakdown(char* out, size_t n) {
 
 void dedup_invalidate(const uint8_t* p, uint64_t size) {
     page_cache_invalidate(p, size);  // the page hashes of this submit
-    // Invalidation is much rarer than upload lookup. Scan the flat table so overlapping ranges are still exact.
-    const uintptr_t lo = uintptr_t(p), hi = lo + size;
-    for (CopySlot& slot : g_copies) {
-        if (slot.generation != g_generation) continue;
-        const uintptr_t start = uintptr_t(slot.p), end = start + slot.entry.size;
-        if (start < hi && end > lo) {
-            if (Front& f = front_of(slot.p); f.p == slot.p) f.generation = 0;
-            slot.generation = 0;
-            --g_copy_count;
+    // Entries starting before p may still reach into it: look back over the few that can.
+    auto it = g_copies.lower_bound(p + size);
+    while (it != g_copies.begin()) {
+        --it;
+        if (it->first + it->second.size <= p) {
+            if (p - it->first > (64ll << 20)) break;  // nothing larger than 64 MB is copied
+            continue;
         }
+        if (Front& f = front_of(it->first); f.p == it->first) f.generation = 0;
+        it = g_copies.erase(it);
     }
 }
 

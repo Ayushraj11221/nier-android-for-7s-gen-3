@@ -252,7 +252,6 @@ inline bool targets_same(const Targets& a, const Targets& b) {
     return true;
 }
 void draw_begin_submit();
-void deferred_lookup_reset();  // discard BindDeferred's cached iterator before each submit's snapshot is used
 void draw_end_submit();  // after the GPU finished the submit
 void linear_targets_write_back(VkCommandBuffer cb);  // nvn_draw.cpp: pitch-linear targets drawn into, back to guest memory
 void draw_log_stats();
@@ -370,7 +369,6 @@ void gpu_profile_collect();
 void gpu_profile_log(uint64_t frames);
 
 namespace replay {
-uint64_t pipeline_state_generation();  // changes when a PipelineKey source field in replay::State changes
 void dedup_reset();  // nvn_dedup.cpp
 void dedup_submit_breakdown(char* out, size_t n);  // nvn_dedup.cpp: what this submit copied into the ring, per kind
 bool written_separate();         // nvn_written.cpp (nvn_draw_state.h)

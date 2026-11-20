@@ -566,7 +566,8 @@ void note_linear_target(uint64_t texture) {
         g_linear_targets.push_back(texture);
 }
 
-bool live_ui_draw(const Targets& t, const Texture* t0) {
+bool live_ui_draw(const Targets& t) {
+    const Texture* t0 = t.color_count && t.colors[0] ? get<Texture>(t.colors[0]) : nullptr;
     return t0 && t0->width >= 1280 && t0->format == 0x25 && t.depth && g_state.depth.depth_test;
 }
 
@@ -584,36 +585,6 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     if (g_state.rasterizer_discard || !g_state.render_enable) return false;  // nothing reaches the targets
     if (shadow_draw_skipped(t)) return false;
     if (bloom_draw_skipped(t)) return false;
-    // Attachment handles and their incarnation-resolved objects stay stable for this draw/replay mark. Resolve once
-    // and reuse through pipeline setup and debug paths; begin_rendering still owns its layout transitions.
-    GpuImage* target_images[8]{};
-    bool target_image_resolved[8]{};
-    auto target_image = [&](uint32_t slot) -> GpuImage* {
-        if (slot >= t.color_count || slot >= 8 || !t.colors[slot]) return nullptr;
-        if (!target_image_resolved[slot]) {
-            target_images[slot] = image_of(t.colors[slot]);
-            target_image_resolved[slot] = target_images[slot] != nullptr;
-        }
-        return target_images[slot];
-    };
-    bool target_depth_resolved = false;
-    GpuImage* target_depth = nullptr;
-    auto depth_image = [&]() -> GpuImage* {
-        if (t.depth && !target_depth_resolved) {
-            target_depth = image_of(t.depth);
-            target_depth_resolved = target_depth != nullptr;
-        }
-        return target_depth;
-    };
-    bool target0_texture_resolved = false;
-    const Texture* target0_texture = nullptr;
-    auto color0_texture = [&]() -> const Texture* {
-        if (t.color_count && t.colors[0] && !target0_texture_resolved) {
-            target0_texture = get<Texture>(t.colors[0]);
-            target0_texture_resolved = target0_texture != nullptr;
-        }
-        return target0_texture;
-    };
     static thread_local std::vector<const ShaderInfo*> combined;
     const auto* shaders = bound_graphics_shaders(combined);
     if (!shaders || shaders->empty()) {
@@ -678,7 +649,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         bool match = (fs && before.compare(0, 16, fs->hash) == 0) || before.compare(0, 16, vs->hash) == 0;
         if (!before.empty() && match && g_stats.total >= from && taken < 8 &&
             t.color_count && t.colors[0])
-            if (GpuImage* img = target_image(0)) {
+            if (GpuImage* img = image_of(t.colors[0])) {
                 taken++;
                 draw_end_rendering(cb, 6);
                 debug_snapshot(cb, *img, 0xB0000000ull + g_stats.total);
@@ -723,7 +694,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         static const bool keep = std::getenv("NX_KEEP_SAMPLED_DEPTH") != nullptr;
         const DepthStencilInfo& d = g_state.depth;
         if (keep || !t.depth || d.depth_test || d.depth_write || d.stencil_test) return t;
-        GpuImage* dimg = depth_image();
+        GpuImage* dimg = image_of(t.depth);
         if (!dimg) return t;
         for (const ResolvedTexture& r : g_textures.resolved)
             if (r.texture && image_of(r.texture) == dimg) {
@@ -737,11 +708,11 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     vertex_read_barrier(cb, vs);  // G4
     g_uw_wide = false;  // NX_ULTRAWIDE: is this draw's target a widened one (viewport, scissor, clears, vs scale)
     if (uw_on()) {
-        GpuImage* wi = t.color_count && t.colors[0] ? target_image(0) : (t.depth ? depth_image() : nullptr);
+        GpuImage* wi = t.color_count && t.colors[0] ? image_of(t.colors[0]) : (t.depth ? image_of(t.depth) : nullptr);
         g_uw_wide = wi && wi->uw;
     }
     {   // NX_HUD_1080: a 1920x1080 image of a 1280x720 target (viewport, scissor and the shaders' render scale)
-        GpuImage* hi = t.color_count && t.colors[0] ? target_image(0) : (t.depth ? depth_image() : nullptr);
+        GpuImage* hi = t.color_count && t.colors[0] ? image_of(t.colors[0]) : (t.depth ? image_of(t.depth) : nullptr);
         g_hud_target = hi && hi->hud;
     }
     bool need_break = gathered & kNeedBreak;
@@ -777,7 +748,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     check_vertex_ranges(vs, fs, indexed, c, in);  // NX_CHECK_VERTS (nvn_written.cpp)
     if (!g_rendering) {
         if (gpu_profile_on()) {
-            GpuImage* img = t.color_count && t.colors[0] ? target_image(0) : nullptr;
+            GpuImage* img = t.color_count && t.colors[0] ? image_of(t.colors[0]) : nullptr;
             char label[128];
             std::snprintf(label, sizeof label, "%ux%u L%u fs %s", img ? img->width : 0, img ? img->height : 0,
                           t.views.level[0], fs ? fs->hash.c_str() : "-");
@@ -787,28 +758,16 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     }
 
     // Pipeline.
-    static thread_local PipelineKey cached_base;
-    static thread_local uint64_t cached_state_gen = 0;
-    static thread_local uint32_t cached_attrib_count = UINT32_MAX, cached_stream_count = UINT32_MAX;
-    const uint64_t state_gen = pipeline_state_generation();
-    const uint32_t attrib_count = uint32_t(std::min<size_t>(g_state.attribs.size(), 16));
-    const uint32_t stream_count = uint32_t(std::min<size_t>(g_state.streams.size(), 16));
-    if (cached_state_gen != state_gen || cached_attrib_count != attrib_count || cached_stream_count != stream_count) {
-        std::memset(&cached_base, 0, sizeof cached_base);  // key bytes, including padding, are compared byte for byte
-        cached_base.attrib_count = attrib_count;
-        std::copy_n(g_state.attribs.begin(), attrib_count, cached_base.attribs);
-        cached_base.stream_count = stream_count;
-        std::copy_n(g_state.streams.begin(), stream_count, cached_base.streams);
-        std::copy_n(g_state.blend, 8, cached_base.blend);
-        cached_base.color = g_state.color, cached_base.mask = g_state.mask;
-        cached_base.depth = g_state.depth, cached_base.polygon = g_state.polygon;
-        cached_state_gen = state_gen;
-        cached_attrib_count = attrib_count, cached_stream_count = stream_count;
-    }
     PipelineKey key;
-    std::memcpy(&key, &cached_base, sizeof key);  // retain deterministic padding for byte-key comparisons
+    std::memset(&key, 0, sizeof key);  // the key is compared byte for byte
     key.vs = vs, key.fs = fs;
     key.topology = mode;
+    key.attrib_count = uint32_t(std::min<size_t>(g_state.attribs.size(), 16));
+    std::copy_n(g_state.attribs.begin(), key.attrib_count, key.attribs);
+    key.stream_count = uint32_t(std::min<size_t>(g_state.streams.size(), 16));
+    std::copy_n(g_state.streams.begin(), key.stream_count, key.streams);
+    std::copy_n(g_state.blend, 8, key.blend);
+    key.color = g_state.color, key.mask = g_state.mask, key.depth = g_state.depth, key.polygon = g_state.polygon;
     // NX_HUD_KEEP_ALPHA=1 (P5R by default, games/p5r/game.cpp): draws into the HUD/menu targets (RGBA8, 1280 wide or
     // more, depth tested) with plain alpha blending leave the target's alpha alone. P5R builds alpha on purpose with
     // its own states (alpha-only masks, MIN/MAX/REVERSE_SUBTRACT; the panels' drop shadows), sets it to 0 under the
@@ -820,13 +779,13 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     // grey when they kept it too (PROGRESO 71). NX_HUD_KEEP_ALPHA=all: untextured ones too; 0: as the game asks.
     static const char* keep_env = std::getenv("NX_HUD_KEEP_ALPHA");
     static const int keep_hud_alpha = !keep_env ? 0 : keep_env[0] == '1' ? 1 : keep_env[0] == 'a' ? 2 : 0;
-    if (keep_hud_alpha && key.color.blend_enable[0] && live_ui_draw(t, color0_texture()) &&
+    if (keep_hud_alpha && key.color.blend_enable[0] && live_ui_draw(t) &&
         (keep_hud_alpha == 2 || !g_textures.bindings.empty())) {
         const BlendTarget& b = key.blend[0];
         if (b.src_rgb == 5 && b.dst_rgb == 6 && b.src_a == 5 && b.dst_a == 6 && b.eq_rgb <= 1 && b.eq_a <= 1)
             key.mask.mask[0] &= 7;
     }
-    if (const uint32_t live = live_flags(); live && live_ui_draw(t, color0_texture())) {
+    if (const uint32_t live = live_flags(); live && live_ui_draw(t)) {
         if (live & kLiveUiAlways) key.depth.depth_func = 8;  // NVN ALWAYS
         if (live & kLiveUiNoWrite) key.depth.depth_write = 0;
         BlendTarget& b = key.blend[0];
@@ -848,11 +807,11 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     key.color_count = t.color_count, key.depth_clamp = g_state.depth_clamp;
     key.alpha_to_coverage = g_state.alpha_to_coverage;
     for (uint32_t k = 0; k < t.color_count; k++) {
-        GpuImage* img = target_image(k);
+        GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
         key.color_formats[k] = img ? view_format(*img, t.views.format[k]) : unused_slot_format();
         if (img && (img->nvn_format == 0x3f || t.views.format[k] == 0x3f)) key.ufloat_colors |= 1u << k;  // G4
     }
-    GpuImage* dimg = tt.depth ? depth_image() : nullptr;
+    GpuImage* dimg = tt.depth ? image_of(tt.depth) : nullptr;
     key.depth_format = dimg && dimg->aspect != VK_IMAGE_ASPECT_COLOR_BIT ? dimg->format : VK_FORMAT_UNDEFINED;
     // NX_ULTRAWIDE. The world is widened by the camera aspect patch (nvn_ultrawide.cpp), so only the 16:9 UI is
     // squeezed by 1/k (centred safe area). The UI is drawn into small BGRA8 layer targets (430x180 for the HUD, never
@@ -861,7 +820,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     // NX_UW_CAMERA=0 (no camera patch): every geometry draw is squeezed, a world-and-UI shrink.
     static const bool cam_patch = !(std::getenv("NX_UW_CAMERA") && std::getenv("NX_UW_CAMERA")[0] == '0');
     if (uw_on() && cam_patch && !g_uw_wide && t.color_count && t.colors[0]) {
-        const Texture* lt = color0_texture();
+        const Texture* lt = get<Texture>(t.colors[0]);
         if (lt && lt->format == 0x25 && (lt->flags & 8)) uw_ui_vertex_shader(vs);
     }
     // NX_UW_UI=learn: only the vertex shaders learned above; default: every draw without depth test (screen-space UI).
@@ -884,8 +843,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         static bool init = [&] { if (e) std::sscanf(e, "%lu:%lu", &from, &n); return true; }();
         (void)init;
         if (e && g_stats.total >= from && g_stats.total < from + n) {
-            GpuImage* wi = t.color_count && t.colors[0] ? target_image(0) : nullptr;
-            const Texture* tx = t.color_count && t.colors[0] ? color0_texture() : nullptr;
+            GpuImage* wi = t.color_count && t.colors[0] ? image_of(t.colors[0]) : nullptr;
+            const Texture* tx = t.color_count && t.colors[0] ? get<Texture>(t.colors[0]) : nullptr;
             std::string smp;
             for (const ResolvedTexture& r : g_textures.resolved) {
                 GpuImage* si = r.texture ? image_of(r.texture) : nullptr;
@@ -1070,7 +1029,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     }
     if (snap_once_left > 0 && fs && snap_once.find(fs->hash) != std::string::npos) snap_by_fs = true, snap_once_left--;
     if ((snap_by_fs || snap_follow(t, vs, fs, g_textures.handles) || debug_snap_wanted(g_stats.done)) && t.color_count && t.colors[0])
-        if (GpuImage* snap = target_image(0)) draw_end_rendering(cb, 6), debug_snapshot(cb, *snap, g_stats.done);
+        if (GpuImage* snap = image_of(t.colors[0])) draw_end_rendering(cb, 6), debug_snapshot(cb, *snap, g_stats.done);
     // NX_DUMP_ON_TARGET=<hex NVNtexture*>: every NX_DUMP_FRAMES-th draw into it asks for NX_DUMP_TEXTURES to be read
     // back right after this submit (before later frames change them).
     static const char* dump_env = std::getenv("NX_DUMP_ON_TARGET");
@@ -1080,8 +1039,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     static const std::string dump_fs = [] { const char* e = std::getenv("NX_DUMP_ON_FS"); return std::string(e ? e : ""); }();
     static const uint64_t dump_from = [] { const char* e = std::getenv("NX_DUMP_FROM"); return e ? std::strtoull(e, nullptr, 10) : 0; }();
     if (!dump_fs.empty() && fs && g_frame >= dump_from && dump_fs.find(fs->hash) != std::string::npos && g_dump_draws < 400 &&
-        t.colors[0] && target_image(0) && (std::getenv("NX_DUMP_ANY") || target_image(0)->view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
-                                                           target_image(0)->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) {
+        t.colors[0] && image_of(t.colors[0]) && (std::getenv("NX_DUMP_ANY") || image_of(t.colors[0])->view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
+                                                           image_of(t.colors[0])->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) {
         debug_dump_add(t.colors[0]);
         for (const ResolvedTexture& r : g_textures.resolved) debug_dump_add(r.texture);
         g_dump_request = ++g_dump_draws;
@@ -1103,7 +1062,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             log("dump_fs: the next draw with %s (frame %llu)", fs_once.c_str(), (unsigned long long)g_frame.load());
         }
     }
-    if (!fs_once.empty() && fs && fs_once.find(fs->hash) != std::string::npos && t.colors[0] && target_image(0)) {
+    if (!fs_once.empty() && fs && fs_once.find(fs->hash) != std::string::npos && t.colors[0] && image_of(t.colors[0])) {
         fs_once.clear(), g_dump_once = true;
         debug_dump_add(t.colors[0]);
         for (const ResolvedTexture& r : g_textures.resolved) debug_dump_add(r.texture);

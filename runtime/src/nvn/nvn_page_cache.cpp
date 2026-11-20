@@ -74,12 +74,15 @@ struct Mirror {
 
 struct Window {
     Mirror mirror[kVersions];
-    uint64_t guest_hash[kPages];  // hash of each guest page, valid when its bit in hashed_pages is set
-    uint64_t hash_generation = 0;
-    uint64_t hashed_pages[2] = {};
+    uint64_t guest_hash[kPages];  // hash of each guest page, valid when guest_gen[page] == the current generation
+    uint64_t guest_gen[kPages];
     uint64_t touched = 0;          // g_submits when last asked
     uint64_t streaming_until = 0;  // g_submits
     uint64_t asked_pages = 0, changed_pages = 0;  // since the last judgement of this window
+    Window() {
+        std::memset(guest_hash, 0, sizeof guest_hash);
+        std::memset(guest_gen, 0, sizeof guest_gen);
+    }
 };
 
 std::unordered_map<uint64_t, Window> g_windows;  // by guest address / kGrid
@@ -119,13 +122,6 @@ bool on() {
 bool verify_on() {
     static const bool v = std::getenv("NX_PAGE_CACHE_VERIFY") != nullptr;
     return v;
-}
-
-uint64_t page_bits(uint32_t first, uint32_t end, uint32_t word) {
-    const uint32_t lo = std::max(first, word * 64), hi = std::min(end, word * 64 + 64);
-    if (lo >= hi) return 0;
-    const uint32_t count = hi - lo, shift = lo - word * 64;
-    return count == 64 ? UINT64_MAX : ((uint64_t(1) << count) - 1) << shift;
 }
 
 uint64_t budget() {
@@ -330,11 +326,7 @@ void page_cache_invalidate(const uint8_t* p, uint64_t size) {
         const uintptr_t base = uintptr_t(g * kGrid);
         const uintptr_t lo = std::max<uintptr_t>(uintptr_t(p), base), hi = std::min<uintptr_t>(uintptr_t(p) + size, base + kWindow);
         if (lo >= hi) continue;
-        Window& w = it->second;
-        if (w.hash_generation != g_gen) continue;
-        const uint32_t a0 = uint32_t((lo - base) / kPage), a1 = uint32_t((hi - 1 - base) / kPage + 1);
-        w.hashed_pages[0] &= ~page_bits(a0, a1, 0);
-        w.hashed_pages[1] &= ~page_bits(a0, a1, 1);
+        for (uint64_t i = (lo - base) / kPage; i <= (hi - 1 - base) / kPage; i++) it->second.guest_gen[i] = 0;
     }
 }
 
@@ -371,27 +363,17 @@ bool page_cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_
         return false;
     }
 
-    // A two-word bitmap makes a repeated/overlapping same-submit range skip the per-page generation checks entirely.
-    if (w.hash_generation != g_gen) {
-        w.hash_generation = g_gen;
-        w.hashed_pages[0] = w.hashed_pages[1] = 0;
+    // The guest pages' hashes (once per page per submit, until a write of the guest invalidates them).
+    const uint64_t t0 = plat::monotonic_ns();
+    for (uint32_t i = a0; i < a1; i++) {
+        if (w.guest_gen[i] == g_gen) continue;
+        w.guest_hash[i] = page_hash(base + uint64_t(i) * kPage);
+        w.guest_gen[i] = g_gen;
+        g_pc_stats.hashed_pages++;
     }
-    const uint64_t needed0 = page_bits(a0, a1, 0), needed1 = page_bits(a0, a1, 1);
-    const uint64_t missing0 = needed0 & ~w.hashed_pages[0], missing1 = needed1 & ~w.hashed_pages[1];
-    if (missing0 || missing1) {
-        const uint64_t t0 = plat::monotonic_ns();
-        for (uint32_t i = a0; i < a1; i++) {
-            const uint32_t word = i >> 6;
-            const uint64_t bit = uint64_t(1) << (i & 63);
-            if (w.hashed_pages[word] & bit) continue;
-            w.guest_hash[i] = page_hash(base + uint64_t(i) * kPage);
-            w.hashed_pages[word] |= bit;
-            g_pc_stats.hashed_pages++;
-        }
-        const uint64_t hash_ns = plat::monotonic_ns() - t0;
-        g_pc_stats.hash_ns += hash_ns;
-        g_judge_ns += hash_ns;  // counted whether or not the range ends up in a mirror: wasted hashing is a cost
-    }
+    const uint64_t hash_ns = plat::monotonic_ns() - t0;
+    g_pc_stats.hash_ns += hash_ns;
+    g_judge_ns += hash_ns;  // counted whether or not the range ends up in a mirror: wasted hashing is a cost
 
     // 1. A mirror holding no changed page: bound as it is, never-used pages filled into it first. Never-used pages are
     //    read by no submit, so this is safe while the mirror is in flight. The fewest pages to fill wins.
