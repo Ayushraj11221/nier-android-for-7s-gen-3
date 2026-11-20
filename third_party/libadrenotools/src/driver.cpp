@@ -15,7 +15,6 @@
 #include "hook/hook_impl_params.h"
 #include <adrenotools/driver.h>
 #include <unistd.h>
-#include <cstdlib>
 
 void *adrenotools_open_libvulkan(int dlopenFlags, int featureFlags, const char *tmpLibDir, const char *hookLibDir, const char *customDriverDir, const char *customDriverName, const char *fileRedirectDir, void **userMappingHandle) {
     // Bail out if linkernsbypass failed to load, this probably means we're on api < 28
@@ -92,11 +91,6 @@ void *adrenotools_open_libvulkan(int dlopenFlags, int featureFlags, const char *
         return nullptr;
 
     return linkernsbypass_namespace_dlopen_unique("/system/lib64/libvulkan.so", tmpLibDir, dlopenFlags, hookNs);
-}
-
-bool adrenotools_set_freedreno_env(const char *varName, const char *value) {
-    if (!varName || !*varName || !value) return false;
-    return setenv(varName, value, 1) == 0;
 }
 
 bool adrenotools_import_user_mem(void *handle, void *hostPtr, uint64_t size) {
