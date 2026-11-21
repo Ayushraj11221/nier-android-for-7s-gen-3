@@ -77,6 +77,9 @@ KThread* self_thread() { return t_self; }
 
 uint64_t heap_size() { return g_heap_size.load(std::memory_order_relaxed); }
 
+std::atomic<uint64_t> g_mapped_physical_bytes{0};
+uint64_t mapped_physical_size() { return g_mapped_physical_bytes.load(std::memory_order_relaxed); }
+
 CPU& current_cpu() { return t_self->ctx; }
 
 #if NX_NCE
@@ -700,14 +703,20 @@ static void svc_impl(CPU& c, uint32_t imm, uint64_t pc) {
         }
         case 0x2A:  // FlushEntireDataCache
             break;
-        case 0x2C:  // MapPhysicalMemory(addr, size)
-            commit(c.x[0], c.x[1]);
-            vm_set(c.x[0], c.x[1], kMemHeap, 3);
+        case 0x2C: {  // MapPhysicalMemory(addr, size)
+            uint64_t addr = c.x[0], size = c.x[1];
+            commit(addr, size);
+            vm_set(addr, size, kMemHeap, 3);
+            g_mapped_physical_bytes.fetch_add(size, std::memory_order_relaxed);
             break;
-        case 0x2D:  // UnmapPhysicalMemory
-            decommit(c.x[0], c.x[1]);
-            vm_set(c.x[0], c.x[1], c.x[0] - kAliasBase < kAliasSize ? kMemFree : kMemInaccessible, 0);
+        }
+        case 0x2D: {  // UnmapPhysicalMemory
+            uint64_t addr = c.x[0], size = c.x[1];
+            decommit(addr, size);
+            vm_set(addr, size, addr - kAliasBase < kAliasSize ? kMemFree : kMemInaccessible, 0);
+            g_mapped_physical_bytes.fetch_sub(size, std::memory_order_relaxed);
             break;
+        }
         case 0x34:
             rc = svc_wait_for_address(c.x[0], uint32_t(c.x[1]), int32_t(c.x[2]), int64_t(c.x[3]));
             break;

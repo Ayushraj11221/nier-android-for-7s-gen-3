@@ -67,6 +67,7 @@ void notify_all();
 KThread* self_thread();
 void backtrace(CPU& c);
 uint64_t heap_size();  // svcSetHeapSize's current size
+uint64_t mapped_physical_size();  // svcMapPhysicalMemory's current size
 
 // svc_process.cpp
 uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t& rc);

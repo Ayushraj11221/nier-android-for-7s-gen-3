@@ -100,7 +100,7 @@ void start_memory_guard() {
     const char* e = std::getenv("NX_MEM_LIMIT_GB");
     double ram = double(sysconf(_SC_PHYS_PAGES)) * double(sysconf(_SC_PAGESIZE)) / double(1ull << 30);
     double gb = e ? std::atof(e) : 0.0;
-    if (gb <= 0) gb = ram > 0 ? ram * 0.6 : 6.0;
+    if (gb <= 0) gb = ram > 0 ? (ram * 0.8) : 6.0;
     const uint64_t limit = uint64_t(gb * double(1ull << 30));
     const char* m = std::getenv("NX_MEMGUARD");
     const std::string mode = m ? m : "statm";
@@ -145,13 +145,23 @@ void start_memory_guard() {
                     (unsigned long long)(kb_field("/proc/self/status", "VmSwap:") >> 10),
                     (unsigned long long)(kb_field("/proc/meminfo", "MemAvailable:") >> 10),
                     (unsigned long long)(kb_field("/proc/meminfo", "SwapFree:") >> 10));
-                log("memory: guest heap virtual size %.2f GB (svcSetHeapSize)",
+                log("memory: guest mapped physical %.2f GB, heap virtual %.2f GB",
+                    double(nx::mapped_physical_size()) / double(1ull << 30),
                     double(nx::heap_size()) / double(1ull << 30));
             }
             if (f > limit) {
-                log("memory: %.2f GB is over the %.1f GB limit (NX_MEM_LIMIT_GB): stopping",
-                    double(f) / double(1ull << 30), gb);
-                _exit(3);
+                uint64_t swap_free_kb = kb_field("/proc/meminfo", "SwapFree:");
+                uint64_t mem_avail_kb = kb_field("/proc/meminfo", "MemAvailable:");
+                if (swap_free_kb < 128 * 1024 && mem_avail_kb < 150 * 1024) {
+                    log("memory: %.2f GB is over the %.1f GB limit and system low (MemAvailable %llu MB, SwapFree %llu MB): stopping",
+                        double(f) / double(1ull << 30), gb,
+                        (unsigned long long)(mem_avail_kb >> 10), (unsigned long long)(swap_free_kb >> 10));
+                    _exit(3);
+                } else {
+#if defined(__BIONIC__) || defined(__ANDROID__)
+                    mallopt(M_PURGE, 0);
+#endif
+                }
             }
         }
     }).detach();
