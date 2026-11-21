@@ -24,6 +24,7 @@
 
 #include <nx/runtime.h>
 
+#include "kernel.h"
 #include "platform.h"
 
 namespace nx::plat {
@@ -129,6 +130,8 @@ void start_memory_guard() {
                     (unsigned long long)(kb_field("/proc/self/status", "VmSwap:") >> 10),
                     (unsigned long long)(kb_field("/proc/meminfo", "MemAvailable:") >> 10),
                     (unsigned long long)(kb_field("/proc/meminfo", "SwapFree:") >> 10));
+                log("memory: guest heap virtual size %.2f GB (svcSetHeapSize)",
+                    double(nx::heap_size()) / double(1ull << 30));
             }
             if (f > limit) {
                 log("memory: %.2f GB is over the %.1f GB limit (NX_MEM_LIMIT_GB): stopping",

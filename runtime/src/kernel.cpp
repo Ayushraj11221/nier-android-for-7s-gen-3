@@ -31,7 +31,7 @@ std::vector<KThread*> g_sync_waiters;
 std::unordered_map<uint32_t, std::shared_ptr<KObject>> g_handles;
 uint32_t g_next_handle = 0x10000;
 std::atomic<uint64_t> g_next_thread_id{0x50};
-uint64_t g_heap_size = 0;
+std::atomic<uint64_t> g_heap_size{0};
 
 std::vector<KThread*> g_mutex_waiters;
 std::vector<KThread*> g_cv_waiters;
@@ -75,7 +75,7 @@ void notify_all() {
 
 KThread* self_thread() { return t_self; }
 
-uint64_t heap_size() { return g_heap_size; }
+uint64_t heap_size() { return g_heap_size.load(std::memory_order_relaxed); }
 
 CPU& current_cpu() { return t_self->ctx; }
 
@@ -442,14 +442,18 @@ static void svc_impl(CPU& c, uint32_t imm, uint64_t pc) {
     switch (imm) {
         case 0x01: {  // SetHeapSize(size) -> addr
             uint64_t size = c.x[1];
+            uint64_t old_size = g_heap_size.load(std::memory_order_relaxed);
             if (size > kHeapMax) {
                 rc = 0xD001;
                 break;
             }
-            if (size > g_heap_size) commit(kHeapBase + g_heap_size, size - g_heap_size);
+            if (size > old_size) commit(kHeapBase + old_size, size - old_size);
             vm_set(kHeapBase, kHeapMax, kMemInaccessible, 0);
             if (size) vm_set(kHeapBase, size, kMemHeap, 3);
-            g_heap_size = size;
+            g_heap_size.store(size, std::memory_order_relaxed);
+            if (size != old_size)
+                log("memory: guest heap size %.2f -> %.2f GB (svcSetHeapSize)",
+                    double(old_size) / double(1ull << 30), double(size) / double(1ull << 30));
             c.x[1] = kHeapBase;
             break;
         }
