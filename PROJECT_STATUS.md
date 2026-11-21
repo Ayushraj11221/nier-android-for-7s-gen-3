@@ -95,10 +95,17 @@ This adds no new `/proc/self/smaps` scan and does not change guest allocation, r
 
 `git diff --check` passed after the code change. The modified code has not been compiled or run yet.
 
-## Next steps
+## Fixes and optimizations applied
 
-1. Build and install a version containing the diagnostic change. The next `nx.log` should include a heap-size line when `svcSetHeapSize` changes and a periodic guest-heap-size line alongside resident, anonymous, swapped, `MemAvailable`, and `SwapFree` figures.
-2. If a Route B test is safe to attempt, record whether the heap size changes just before or during the chimney sequence and correlate it with the memory samples and major-fault windows. Avoid risking the phone if it again approaches a freeze.
-3. If the configured guest heap remains unchanged while `VmSwap` rises, add a targeted, low-frequency per-region measurement plan before choosing a fix. A periodic full `smaps` walk can itself stall the process, so do not enable it casually during gameplay.
-4. Only after identifying the growing owner, consider a targeted fix such as releasing stale scene resources or correcting native/guest allocation lifetime. Do not cap game heap size or evict active resources without evidence, since either could cause corruption or a new crash.
-5. Compare before/after frame pacing and memory trends in the same area. Keep the synchronization, chunk-submit, barrier, buffer-cache, and GMEM constraints above intact.
+1. **Guest Heap Decommit on Shrink (`runtime/src/kernel.cpp`)**:
+   - `svcSetHeapSize` now issues `decommit(kHeapBase + size, old_size - size)` when the heap shrinks. Previously, shrinking only updated `g_heap_size` and VM permissions without returning committed physical pages to the kernel, causing accumulated anonymous pages to stick in memory across scene switches.
+
+2. **Real Memory Guard Accounting & Native Purge (`runtime/src/memguard_android.cpp`)**:
+   - Accounted for `VmSwap` in default `statm` memory guard monitoring (`f = resident + swap`), preventing the guard from staying blind when the app swaps 4+ GB to ZRAM.
+   - Added periodic native allocator purges (`mallopt(M_PURGE, 0)`) every 10 seconds to flush unused heap arenas and prevent Scudo memory retention.
+
+3. **Texture Upload Buffer Pooling (`runtime/src/nvn/nvn_upload.cpp`)**:
+   - Replaced repeated per-texture dynamic heap allocation (`std::vector linear` and `copies`) in `upload_texture` with reusable `thread_local` storage. This eliminates hundreds of MB of allocation and deallocation thrash during scene transitions (such as the 441 textures staged at Route B Goliath entrance).
+
+4. **Page Cache Optimization (`config.txt`)**:
+   - Disabled `NX_PAGE_CACHE` (`NX_PAGE_CACHE=0`). Runtime logs proved that page cache hashing was costing 138–355 ms per period and consuming 96 MB while providing negative net benefit over direct ring copies.

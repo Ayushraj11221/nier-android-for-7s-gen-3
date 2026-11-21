@@ -185,8 +185,10 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img, uint64_
     // NX_NO_UPLOAD_GUARD=1 too; bisecting).
     static const bool narrow = std::getenv("NX_R11G11B10_NARROW") != nullptr;
     bool widen = !narrow && t.format == 0x3f && img.format == VK_FORMAT_R16G16B16A16_SFLOAT && !img.alpha_from_r;
-    std::vector<uint8_t> linear;
-    std::vector<VkBufferImageCopy> copies;
+    static thread_local std::vector<uint8_t> linear;
+    static thread_local std::vector<VkBufferImageCopy> copies;
+    linear.clear();
+    copies.clear();
     uint32_t layers = img.view_type == VK_IMAGE_VIEW_TYPE_3D ? std::max(1u, t.depth) : img.layers;
     if (img.alpha_from_r && t.stride) {  // R8 pitch-linear -> RGBA8 (255, 255, 255, R), level 0
         const uint8_t* src = reinterpret_cast<const uint8_t*>(t.memory);

@@ -14,6 +14,13 @@
 // Each read is timed; memguard_overlap_ns tells how much of a time window a read covered (the hitch lines).
 #include <unistd.h>
 
+#if defined(__BIONIC__) || defined(__ANDROID__)
+#include <malloc.h>
+#ifndef M_PURGE
+#define M_PURGE (-101)
+#endif
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -114,14 +121,22 @@ void start_memory_guard() {
             Read& r = g_reads[g_read_next.fetch_add(1) % 16];
             uint64_t t0 = monotonic_ns();
             r.end = 0, r.begin = t0;
-            uint64_t f = smaps ? smaps_pss_bytes() : statm_resident_bytes();
+            uint64_t resident = smaps ? smaps_pss_bytes() : statm_resident_bytes();
+            uint64_t swap = (kb_field("/proc/self/status", "VmSwap:") << 10);
+            uint64_t f = resident + (smaps ? 0 : swap);
             uint64_t t1 = monotonic_ns();
             r.end = t1;
             read_ns += t1 - t0, read_max = std::max(read_max, t1 - t0);
             if (f > peak) peak = f;
+#if defined(__BIONIC__) || defined(__ANDROID__)
+            if (ticks % 40 == 0) {
+                mallopt(M_PURGE, 0);
+            }
+#endif
             if (++ticks % 120 == 0) {
-                log("memory: %.2f GB %s (peak %.2f GB, limit %.1f GB), read avg %.2f ms, max %.2f ms",
-                    double(f) / double(1ull << 30), smaps ? "Pss (smaps)" : "resident (statm)",
+                log("memory: %.2f GB %s (resident %.2f GB, peak %.2f GB, limit %.1f GB), read avg %.2f ms, max %.2f ms",
+                    double(f) / double(1ull << 30), smaps ? "Pss (smaps)" : "total anon+swap",
+                    double(resident) / double(1ull << 30),
                     double(peak) / double(1ull << 30), gb, double(read_ns) / 120e6, double(read_max) / 1e6);
                 read_ns = read_max = 0;
                 log("memory: anon %llu MB, file %llu MB, swapped %llu MB (VmSwap) | system: MemAvailable %llu MB, SwapFree %llu MB",

@@ -448,6 +448,7 @@ static void svc_impl(CPU& c, uint32_t imm, uint64_t pc) {
                 break;
             }
             if (size > old_size) commit(kHeapBase + old_size, size - old_size);
+            else if (size < old_size) decommit(kHeapBase + size, old_size - size);
             vm_set(kHeapBase, kHeapMax, kMemInaccessible, 0);
             if (size) vm_set(kHeapBase, size, kMemHeap, 3);
             g_heap_size.store(size, std::memory_order_relaxed);
